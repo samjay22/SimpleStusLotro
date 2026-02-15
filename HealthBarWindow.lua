@@ -64,6 +64,14 @@ function HealthBarWindow:Constructor()
     self.targetOpacity = self.inCombat and (self.combatOpacity / 100) or (self.oocOpacity / 100);
     self:SetOpacity(self.targetOpacity);
 
+    -- Create buff panel BEFORE first build so RebuildBars can position it
+    self.buffRows = {};
+    self.activeBuffs = {};
+    self.buffPanel = Turbine.UI.Control();
+    self.buffPanel:SetParent(self);
+    self.buffPanel:SetMouseVisible(false);
+    self.buffPanel:SetZOrder(50);
+
     -- Build the bars (first build includes position loading)
     self.firstBuild = true;
     self:RebuildBars();
@@ -78,6 +86,11 @@ function HealthBarWindow:Constructor()
     -- SETTINGS PANEL (visible only when unlocked)
     -- =====================
     self:CreateSettingsPanel();
+
+    -- =====================
+    -- STATS TOOLTIP (hover over bars to see stats)
+    -- =====================
+    self:CreateStatsTooltip();
 
     -- Default to locked
     self:SetUnlocked(false);
@@ -133,26 +146,30 @@ function HealthBarWindow:Constructor()
     self:CreateAlertLabel();
 
     -- =====================
-    -- DEBUFF / EFFECT WATCHER
+    -- DEBUFF / EFFECT WATCHER & BUFF BAR
     -- =====================
+
     local effects = self.player:GetEffects();
     if effects then
         effects.EffectAdded = function(sender, args)
             self:OnEffectAdded(args);
+            self:RefreshBuffList();
         end;
         effects.EffectRemoved = function(sender, args)
-            -- Could alert "X removed" but keeping it to additions only
+            self:RefreshBuffList();
         end;
     end;
 
     -- Initial update
     self:UpdateHealth();
     self:UpdatePower();
+    self:RefreshBuffList();
 
     -- Periodic timer for missed events AND live preview rebuilds
     self.updateTimer = Turbine.UI.Control();
     self.updateTimer:SetWantsUpdates(true);
     self.updateTimer.accumulator = 0;
+    self.updateTimer.buffTick = 0;
     self.updateTimer.Update = function(sender, args)
         -- Live preview: rebuild with throttle (at most once per 8 ticks ~0.5s)
         if win.rebuildNeeded then
@@ -175,6 +192,14 @@ function HealthBarWindow:Constructor()
             end
         end
 
+        -- Buff Timer (every 10 ticks ~0.3s)
+        if not sender.buffTick then sender.buffTick = 0; end
+        sender.buffTick = sender.buffTick + 1;
+        if sender.buffTick >= 10 then
+            sender.buffTick = 0;
+            win:UpdateBuffTimers();
+        end
+
         -- Periodic health/power refresh
         sender.accumulator = sender.accumulator + 1;
         if sender.accumulator >= 30 then
@@ -195,11 +220,36 @@ function HealthBarWindow:RebuildBars()
     self.rebuilding = true;
 
     local totalWidth = self.centerGap + (self.curveDepth * 2) + 400;
-    local totalHeight = self.barHeightTotal + 60;
+    local barAreaHeight = self.barHeightTotal + 60;
+
+    -- Calculate buff area height based on how many rows we need
+    local BUFF_ICON_SIZE = 36;
+    local BUFF_SPACING = 4;
+    local BUFF_ROW_HEIGHT = BUFF_ICON_SIZE + 18; -- icon + timer text
+    local iconsPerRow = math.floor((totalWidth + BUFF_SPACING) / (BUFF_ICON_SIZE + BUFF_SPACING));
+    if iconsPerRow < 1 then iconsPerRow = 1; end
+    self.buffIconsPerRow = iconsPerRow;
+
+    -- Estimate rows needed (use cached count or default to 1 row)
+    local buffCount = self.lastBuffCount or 0;
+    local numRows = math.ceil(buffCount / iconsPerRow);
+    if numRows < 1 then numRows = 1; end
+    local buffHeight = numRows * (BUFF_ROW_HEIGHT + BUFF_SPACING) + 4;
+    if buffHeight < BUFF_ROW_HEIGHT + 8 then buffHeight = BUFF_ROW_HEIGHT + 8; end
+
+    local totalHeight = barAreaHeight + buffHeight;
 
     self:SetSize(totalWidth, totalHeight);
     self:SetBackColor(Turbine.UI.Color(0, 0, 0, 0));
     self:SetText("");
+
+    -- Configure Buff Panel Position (centered below bars)
+    if self.buffPanel then
+        local panelW = totalWidth;
+        self.buffPanel:SetSize(panelW, buffHeight);
+        self.buffPanel:SetPosition(0, barAreaHeight);
+        self.buffPanel:SetZOrder(50);
+    end
 
     -- Only load/set position on the very first build
     if self.firstBuild then
@@ -239,7 +289,7 @@ function HealthBarWindow:RebuildBars()
     self.healthTextShadow:SetForeColor(Turbine.UI.Color(1, 0, 0, 0));
     self.healthTextShadow:SetTextAlignment(Turbine.UI.ContentAlignment.MiddleRight);
     self.healthTextShadow:SetSize(labelWidth, labelHeight);
-    self.healthTextShadow:SetPosition(leftBase - labelWidth - self.curveDepth - 10 + 2, (totalHeight / 2) - 15 + 2);
+    self.healthTextShadow:SetPosition(leftBase - labelWidth - self.curveDepth - 10 + 2, (barAreaHeight / 2) - 15 + 2);
     self.healthTextShadow:SetZOrder(9);
     self.healthTextShadow:SetMouseVisible(false);
 
@@ -251,7 +301,7 @@ function HealthBarWindow:RebuildBars()
     self.healthText:SetForeColor(Turbine.UI.Color(1, 0.2, 1.0, 0.2));
     self.healthText:SetTextAlignment(Turbine.UI.ContentAlignment.MiddleRight);
     self.healthText:SetSize(labelWidth, labelHeight);
-    self.healthText:SetPosition(leftBase - labelWidth - self.curveDepth - 10, (totalHeight / 2) - 15);
+    self.healthText:SetPosition(leftBase - labelWidth - self.curveDepth - 10, (barAreaHeight / 2) - 15);
     self.healthText:SetZOrder(10);
     self.healthText:SetMouseVisible(false);
 
@@ -263,7 +313,7 @@ function HealthBarWindow:RebuildBars()
     self.powerTextShadow:SetForeColor(Turbine.UI.Color(1, 0, 0, 0));
     self.powerTextShadow:SetTextAlignment(Turbine.UI.ContentAlignment.MiddleLeft);
     self.powerTextShadow:SetSize(labelWidth, labelHeight);
-    self.powerTextShadow:SetPosition(rightBase + self.curveDepth + 10 + 2, (totalHeight / 2) - 15 + 2);
+    self.powerTextShadow:SetPosition(rightBase + self.curveDepth + 10 + 2, (barAreaHeight / 2) - 15 + 2);
     self.powerTextShadow:SetZOrder(9);
     self.powerTextShadow:SetMouseVisible(false);
 
@@ -275,30 +325,36 @@ function HealthBarWindow:RebuildBars()
     self.powerText:SetForeColor(Turbine.UI.Color(1, 0.2, 0.6, 1.0));
     self.powerText:SetTextAlignment(Turbine.UI.ContentAlignment.MiddleLeft);
     self.powerText:SetSize(labelWidth, labelHeight);
-    self.powerText:SetPosition(rightBase + self.curveDepth + 10, (totalHeight / 2) - 15);
+    self.powerText:SetPosition(rightBase + self.curveDepth + 10, (barAreaHeight / 2) - 15);
     self.powerText:SetZOrder(10);
     self.powerText:SetMouseVisible(false);
 
     -- Reposition instruction labels after rebuild
     if self.dragLabel then
-        self.dragLabel:SetPosition((totalWidth / 2) - 150, (totalHeight / 2) - 55);
+        self.dragLabel:SetPosition((totalWidth / 2) - 150, (barAreaHeight / 2) - 55);
         self.dragLabel:SetZOrder(200);
     end
     if self.lockLabel then
-        self.lockLabel:SetPosition((totalWidth / 2) - 150, (totalHeight / 2) - 25);
+        self.lockLabel:SetPosition((totalWidth / 2) - 150, (barAreaHeight / 2) - 25);
         self.lockLabel:SetZOrder(200);
     end
 
-    -- Reposition alert label
+    -- Reposition alert label (at bottom of bar area, above buff row)
     if self.alertLabel then
-        self.alertLabel:SetPosition((totalWidth / 2) - 200, totalHeight - 35);
+        self.alertLabel:SetPosition((totalWidth / 2) - 200, barAreaHeight - 35);
     end
     if self.alertShadow then
-        self.alertShadow:SetPosition((totalWidth / 2) - 200 + 2, totalHeight - 35 + 2);
+        self.alertShadow:SetPosition((totalWidth / 2) - 200 + 2, barAreaHeight - 35 + 2);
     end
 
     if self.isUnlocked then
         self:SetMouseVisible(true);
+    end
+
+    -- Reposition stats hover zone
+    if self.statsHoverZone then
+        self.statsHoverZone:SetSize(totalWidth, barAreaHeight);
+        self.statsHoverZone:SetPosition(0, 0);
     end
 
     -- Force a full update (reset cached state)
@@ -306,6 +362,9 @@ function HealthBarWindow:RebuildBars()
     self.lastPowerPct = -1;
     self:UpdateHealth();
     self:UpdatePower();
+
+    -- Refresh buff layout after bars are built
+    self:RefreshBuffList();
 
     self.rebuilding = false;
 end
@@ -353,6 +412,127 @@ function HealthBarWindow:UpdateVerticalCurve(pool, xBase, color, isFill, directi
     end
 
     return pool;
+end
+
+-- =========================================================================
+-- STATS TOOLTIP (hover over bar area to see character stats)
+-- =========================================================================
+function HealthBarWindow:CreateStatsTooltip()
+    local win = self;
+
+    -- Invisible hover zone that covers the bar area
+    self.statsHoverZone = Turbine.UI.Control();
+    self.statsHoverZone:SetParent(self);
+    self.statsHoverZone:SetBackColor(Turbine.UI.Color(0, 0, 0, 0));
+    self.statsHoverZone:SetMouseVisible(true);
+    self.statsHoverZone:SetZOrder(5); -- below bar segments (they have mouse off), above nothing
+
+    -- The tooltip window itself (top-level so it can overflow)
+    self.statsWindow = Turbine.UI.Window();
+    self.statsWindow:SetSize(240, 280);
+    self.statsWindow:SetBackColor(Turbine.UI.Color(0.92, 0.05, 0.05, 0.12));
+    self.statsWindow:SetVisible(false);
+    self.statsWindow:SetZOrder(600);
+    self.statsWindow:SetMouseVisible(false);
+    self.statsWindow:SetOpacity(1);
+    self.statsWindow:SetText("");
+
+    -- Title
+    self.statsTitle = Turbine.UI.Label();
+    self.statsTitle:SetParent(self.statsWindow);
+    self.statsTitle:SetSize(232, 24);
+    self.statsTitle:SetPosition(4, 4);
+    self.statsTitle:SetFont(Turbine.UI.Lotro.Font.Verdana16);
+    self.statsTitle:SetForeColor(Turbine.UI.Color(1, 1.0, 0.85, 0.4));
+    self.statsTitle:SetTextAlignment(Turbine.UI.ContentAlignment.TopCenter);
+    self.statsTitle:SetMouseVisible(false);
+    self.statsTitle:SetText("Character Stats");
+
+    -- Stats body
+    self.statsBody = Turbine.UI.Label();
+    self.statsBody:SetParent(self.statsWindow);
+    self.statsBody:SetSize(232, 248);
+    self.statsBody:SetPosition(4, 28);
+    self.statsBody:SetFont(Turbine.UI.Lotro.Font.Verdana14);
+    self.statsBody:SetForeColor(Turbine.UI.Color(1, 0.9, 0.9, 0.9));
+    self.statsBody:SetTextAlignment(Turbine.UI.ContentAlignment.TopLeft);
+    self.statsBody:SetMouseVisible(false);
+
+    -- Hover events on the zone
+    self.statsHoverZone.MouseEnter = function(sender, args)
+        if win.isUnlocked then return; end -- Don't show when dragging
+        win:UpdateStatsTooltip();
+        -- Position near the center of the window
+        local wx, wy = win:GetPosition();
+        local ww, wh = win:GetSize();
+        win.statsWindow:SetPosition(wx + (ww / 2) - 120, wy - 290);
+        win.statsWindow:SetVisible(true);
+    end;
+    self.statsHoverZone.MouseLeave = function(sender, args)
+        win.statsWindow:SetVisible(false);
+    end;
+end
+
+function HealthBarWindow:UpdateStatsTooltip()
+    local p = self.player;
+    local lines = {};
+
+    -- Morale / Power
+    local morale = p:GetMorale() or 0;
+    local maxMorale = p:GetMaxMorale() or 1;
+    local power = p:GetPower() or 0;
+    local maxPower = p:GetMaxPower() or 1;
+    table.insert(lines, string.format("Morale: %d / %d", morale, maxMorale));
+    table.insert(lines, string.format("Power:  %d / %d", power, maxPower));
+    table.insert(lines, "");
+
+    -- Base Attributes via GetAttributes()
+    local ok, attrs = pcall(function() return p:GetAttributes() end);
+    if ok and attrs then
+        local function getStat(fn)
+            local s, v = pcall(fn);
+            return (s and v) or "?";
+        end
+
+        if attrs.GetMight then
+            table.insert(lines, "Might:    " .. tostring(getStat(function() return attrs:GetMight() end)));
+        end
+        if attrs.GetAgility then
+            table.insert(lines, "Agility:  " .. tostring(getStat(function() return attrs:GetAgility() end)));
+        end
+        if attrs.GetVitality then
+            table.insert(lines, "Vitality: " .. tostring(getStat(function() return attrs:GetVitality() end)));
+        end
+        if attrs.GetWill then
+            table.insert(lines, "Will:     " .. tostring(getStat(function() return attrs:GetWill() end)));
+        end
+        if attrs.GetFate then
+            table.insert(lines, "Fate:     " .. tostring(getStat(function() return attrs:GetFate() end)));
+        end
+        table.insert(lines, "");
+
+        -- Ratings
+        if attrs.GetCriticalRating then
+            table.insert(lines, "Critical:   " .. tostring(getStat(function() return attrs:GetCriticalRating() end)));
+        end
+        if attrs.GetPhysicalMastery then
+            table.insert(lines, "Phys Mast:  " .. tostring(getStat(function() return attrs:GetPhysicalMastery() end)));
+        end
+        if attrs.GetTacticalMastery then
+            table.insert(lines, "Tact Mast:  " .. tostring(getStat(function() return attrs:GetTacticalMastery() end)));
+        end
+        if attrs.GetArmour then
+            table.insert(lines, "Armour:     " .. tostring(getStat(function() return attrs:GetArmour() end)));
+        end
+        if attrs.GetResistance then
+            table.insert(lines, "Resistance: " .. tostring(getStat(function() return attrs:GetResistance() end)));
+        end
+    else
+        -- Fallback: try individual methods on player directly
+        table.insert(lines, "Level: " .. tostring(p:GetLevel() or "?"));
+    end
+
+    self.statsBody:SetText(table.concat(lines, "\n"));
 end
 
 function HealthBarWindow:DestroySegments()
@@ -882,4 +1062,289 @@ function HealthBarWindow:LoadSettings()
         self.combatOpacity = settings.combatOpacity or self.combatOpacity;
         self.oocOpacity = settings.oocOpacity or self.oocOpacity;
     end
+end
+
+-- =========================================================================
+-- BUFF DISPLAY SYSTEM
+-- =========================================================================
+function HealthBarWindow:RefreshBuffList()
+    -- Configuration for Buff Layout
+    local BUFF_SIZE = 36;
+    local SPACING = 4;
+    local ROW_HEIGHT = BUFF_SIZE + 18; -- icon + timer text below
+    
+    if not self.buffRows then self.buffRows = {}; end
+    if not self.buffPanel then return; end
+
+    -- Hide all existing buff items
+    for _, item in ipairs(self.buffRows) do
+        item:SetVisible(false);
+    end
+    self.activeBuffs = {};
+    
+    local effects = self.player:GetEffects();
+    if not effects then return; end
+    
+    local count = effects:GetCount();
+    
+    -- First pass: Collect valid buffs (non-harmful, duration <= 12 hours)
+    local MAX_DURATION = 43200; -- 12 hours in seconds
+    local validEffects = {};
+    for i = 1, count do
+        local effect = effects:Get(i);
+        if not self:IsEffectHarmful(effect) then
+            -- Filter: only show short-duration buffs (12h or less)
+            local dominated = false;
+            local ok, dur = pcall(function() return effect:GetDuration() end);
+            if ok and dur then
+                -- dur <= 0 means permanent/toggle, dur > MAX_DURATION means very long buff
+                if dur <= 0 or dur > MAX_DURATION then
+                    dominated = true;
+                end
+            end
+            if not dominated then
+                table.insert(validEffects, effect);
+            end
+        end
+    end
+
+    local numBuffs = #validEffects;
+    
+    -- If count changed, trigger a rebuild so the window resizes
+    if self.lastBuffCount ~= numBuffs then
+        self.lastBuffCount = numBuffs;
+        -- Only flag rebuild if we're not already inside one
+        if not self.rebuilding then
+            self.rebuildNeeded = true;
+        end
+    end
+
+    -- Calculate how many icons fit per row
+    local panelW = self.buffPanel:GetWidth();
+    local iconsPerRow = math.floor((panelW + SPACING) / (BUFF_SIZE + SPACING));
+    if iconsPerRow < 1 then iconsPerRow = 1; end
+
+    for i, effect in ipairs(validEffects) do
+        local item = self.buffRows[i];
+        if not item then
+            item = self:CreateBuffIconItem();
+            table.insert(self.buffRows, item);
+        end
+        
+        -- Update Content
+        local success, err = pcall(function() item:SetEffect(effect); end);
+        if not success then
+             item.icon:SetVisible(false);
+        end
+
+        -- Calculate row and column
+        local col = (i - 1) % iconsPerRow;
+        local row = math.floor((i - 1) / iconsPerRow);
+
+        -- Center each row: figure out how many icons are in this row
+        local rowStart = row * iconsPerRow + 1;
+        local rowEnd = math.min(rowStart + iconsPerRow - 1, numBuffs);
+        local iconsInRow = rowEnd - rowStart + 1;
+        local rowWidth = iconsInRow * BUFF_SIZE + (iconsInRow - 1) * SPACING;
+        local rowOffsetX = (panelW - rowWidth) / 2;
+        if rowOffsetX < 0 then rowOffsetX = 0; end
+
+        local xPos = rowOffsetX + col * (BUFF_SIZE + SPACING);
+        local yPos = row * (ROW_HEIGHT + SPACING);
+        item:SetPosition(xPos, yPos);
+        item:SetVisible(true);
+        
+        table.insert(self.activeBuffs, item);
+    end
+end
+
+function HealthBarWindow:CreateBuffIconItem()
+    local size = 36;
+    local item = Turbine.UI.Control();
+    item:SetParent(self.buffPanel);
+    item:SetSize(size, size + 16); -- Extra height for timer text below/overlay
+    item:SetMouseVisible(true); -- Enable mouse for tooltip
+    
+    -- Tooltip window (shown on hover) — large enough for full effect descriptions
+    local TT_WIDTH = 300;
+    item.tooltip = Turbine.UI.Window();
+    item.tooltip:SetSize(TT_WIDTH, 200);
+    item.tooltip:SetBackColor(Turbine.UI.Color(0.92, 0.05, 0.05, 0.12));
+    item.tooltip:SetVisible(false);
+    item.tooltip:SetZOrder(500);
+    item.tooltip:SetMouseVisible(false);
+    item.tooltip:SetOpacity(1);
+    
+    -- Name line (gold, bold)
+    item.tooltipName = Turbine.UI.Label();
+    item.tooltipName:SetParent(item.tooltip);
+    item.tooltipName:SetSize(TT_WIDTH - 8, 22);
+    item.tooltipName:SetPosition(4, 4);
+    item.tooltipName:SetFont(Turbine.UI.Lotro.Font.Verdana16);
+    item.tooltipName:SetForeColor(Turbine.UI.Color(1, 1.0, 0.85, 0.4));
+    item.tooltipName:SetTextAlignment(Turbine.UI.ContentAlignment.TopLeft);
+    item.tooltipName:SetMouseVisible(false);
+    
+    -- Description / stats area (large, multi-line)
+    item.tooltipDesc = Turbine.UI.Label();
+    item.tooltipDesc:SetParent(item.tooltip);
+    item.tooltipDesc:SetSize(TT_WIDTH - 8, 170);
+    item.tooltipDesc:SetPosition(4, 28);
+    item.tooltipDesc:SetFont(Turbine.UI.Lotro.Font.Verdana14);
+    item.tooltipDesc:SetForeColor(Turbine.UI.Color(1, 0.9, 0.9, 0.9));
+    item.tooltipDesc:SetTextAlignment(Turbine.UI.ContentAlignment.TopLeft);
+    item.tooltipDesc:SetMouseVisible(false);
+    
+    -- Hover events
+    item.MouseEnter = function(sender, args)
+        if sender.effectName and sender.effectName ~= "" then
+            sender.tooltipName:SetText(sender.effectName);
+            
+            -- Build full tooltip body with description + extra info
+            local body = "";
+            if sender.effectDesc and sender.effectDesc ~= "" then
+                body = sender.effectDesc;
+            end
+            
+            -- Append duration info
+            if sender.effectDuration and sender.effectDuration > 0 then
+                local dur = sender.effectDuration;
+                local durStr;
+                if dur >= 3600 then
+                    durStr = string.format("%.1f hours", dur / 3600);
+                elseif dur >= 60 then
+                    durStr = string.format("%d min %d sec", math.floor(dur/60), math.floor(dur%60));
+                else
+                    durStr = string.format("%d sec", math.floor(dur));
+                end
+                if body ~= "" then body = body .. "\n"; end
+                body = body .. "\nDuration: " .. durStr;
+            end
+            
+            sender.tooltipDesc:SetText(body);
+            
+            -- Estimate tooltip height based on content
+            local lines = 2; -- name + padding
+            for _ in string.gmatch(body, "\n") do lines = lines + 1; end
+            -- Rough estimate: ~16px per line of description
+            local descLines = math.max(lines, math.ceil(string.len(body) / 38));
+            local ttHeight = 32 + descLines * 16;
+            if ttHeight < 60 then ttHeight = 60; end
+            if ttHeight > 300 then ttHeight = 300; end
+            sender.tooltip:SetSize(TT_WIDTH, ttHeight);
+            sender.tooltipDesc:SetSize(TT_WIDTH - 8, ttHeight - 32);
+            
+            -- Position tooltip above the icon
+            local ix, iy = sender:GetPosition();
+            local px, py = self.buffPanel:GetPosition();
+            local wx, wy = self:GetPosition();
+            sender.tooltip:SetPosition(wx + px + ix - (TT_WIDTH/2) + (size/2), wy + py + iy - ttHeight - 4);
+            sender.tooltip:SetVisible(true);
+        end
+    end;
+    item.MouseLeave = function(sender, args)
+        sender.tooltip:SetVisible(false);
+    end;
+    
+    -- Icon
+    item.icon = Turbine.UI.Control();
+    item.icon:SetParent(item);
+    item.icon:SetSize(size, size);
+    item.icon:SetPosition(0, 0);
+    item.icon:SetBlendMode(Turbine.UI.BlendMode.AlphaBlend);
+    item.icon:SetMouseVisible(false);
+    
+    -- Timer Overlay
+    item.timerLabel = Turbine.UI.Label();
+    item.timerLabel:SetParent(item);
+    item.timerLabel:SetSize(size + 10, 16);
+    item.timerLabel:SetPosition(-5, size - 4); -- Just below/overlapping bottom
+    item.timerLabel:SetFont(Turbine.UI.Lotro.Font.Verdana12);
+    item.timerLabel:SetForeColor(Turbine.UI.Color(1, 1.0, 1.0, 1.0));
+    item.timerLabel:SetTextAlignment(Turbine.UI.ContentAlignment.TopCenter);
+    item.timerLabel:SetOutlineColor(Turbine.UI.Color(1, 0, 0, 0)); -- Shadow effect
+    item.timerLabel:SetFontStyle(Turbine.UI.FontStyle.Outline);
+    item.timerLabel:SetMouseVisible(false);
+    
+    -- Method to set data — extract all available effect info
+    item.SetEffect = function(sender, effect)
+        sender.effect = effect;
+        
+        -- Store name
+        local nameOk, eName = pcall(function() return effect:GetName() end);
+        sender.effectName = (nameOk and eName) or "";
+        
+        -- Store description (this is where stat info lives in the Turbine API)
+        local descOk, eDesc = pcall(function() return effect:GetDescription() end);
+        sender.effectDesc = (descOk and eDesc) or "";
+        
+        -- Store duration for tooltip
+        local durOk, eDur = pcall(function() return effect:GetDuration() end);
+        sender.effectDuration = (durOk and eDur) or 0;
+        
+        -- Try to get icon
+        local status, iconID = pcall(function() return effect:GetIcon() end);
+        if status and iconID and type(iconID) == "number" then
+            sender.icon:SetBackground(iconID);
+            sender.icon:SetVisible(true);
+        else
+            sender.icon:SetVisible(false);
+        end
+    end
+    
+    return item;
+end
+
+function HealthBarWindow:UpdateBuffTimers()
+    if not self.activeBuffs then return; end
+    local currentTime = Turbine.Engine.GetGameTime();
+    
+    for _, row in ipairs(self.activeBuffs) do
+        if row.effect then
+            local duration = row.effect:GetDuration();
+            local startTime = row.effect:GetStartTime();
+            
+            -- If duration is 0 or very large, it's permanent/toggle
+            if duration > 86400 or duration <= 0 then
+                row.timerLabel:SetText("");
+            else
+                local remaining = duration - (currentTime - startTime);
+                if remaining < 0 then remaining = 0; end
+                
+                -- Format time
+                local mins = math.floor(remaining / 60);
+                local secs = math.floor(remaining % 60);
+                if mins > 60 then
+                     row.timerLabel:SetText(string.format("%dh", math.floor(mins/60)));
+                elseif mins > 0 then
+                     row.timerLabel:SetText(string.format("%d:%02d", mins, secs));
+                else
+                     row.timerLabel:SetText(string.format("%ds", secs));
+                end
+            end
+        end
+    end
+end
+
+function HealthBarWindow:IsEffectHarmful(effect)
+    if not effect then return false; end
+    
+    -- Check API flag first
+    if effect.IsDebuff and effect:IsDebuff() then return true; end
+    
+    -- Check keywords in name
+    local name = effect:GetName();
+    if not name then return false; end
+    
+    local nameLower = string.lower(name);
+    local debuffKeywords = { "bleed", "wound", "poison", "disease", "fear", "dread",
+        "stun", "daze", "root", "slow", "debuff", "curse", "fire", "acid",
+        "shadow", "corruption", "dot", "drain" };
+        
+    for _, kw in ipairs(debuffKeywords) do
+        if string.find(nameLower, kw) then
+            return true;
+        end
+    end
+    return false;
 end
