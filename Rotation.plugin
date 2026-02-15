@@ -1,0 +1,10 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Plugin>
+    <Information>
+        <Name>Easy Health Bar</Name>
+        <Author>Samuel Taylor</Author>
+        <Version>1.0.0</Version>
+        <Description>A draggable health and power bar display. Use /ehb help for commands.</Description>
+    </Information>
+    <Package>EasyHealthBar.Main</Package>
+</Plugin>
