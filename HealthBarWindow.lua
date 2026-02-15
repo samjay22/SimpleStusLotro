@@ -6,6 +6,71 @@ import "Turbine.Gameplay";
 import "Turbine.UI";
 import "Turbine.UI.Lotro";
 
+-- =========================================================================
+-- CONSTANTS (File-scope, accessible to all functions)
+-- =========================================================================
+CONSTANTS = {
+    -- Buff Display
+    BUFF_ICON_SIZE = 36,
+    BUFF_SPACING = 4,
+    BUFF_ROW_HEIGHT = 36 + 18,
+    MAX_BUFF_DURATION = 43200, -- 12 hours in seconds
+    
+    -- Update Timings
+    REBUILD_COOLDOWN_TICKS = 2,
+    
+    -- Alert System
+    ALERT_DURATION_TICKS = 60,
+    ALERT_FADE_TICKS = 15,
+    LOW_THRESHOLD = 0.3,
+    
+    -- UI Sizing
+    LABEL_WIDTH = 200,
+    LABEL_HEIGHT = 30,
+    STATS_TOOLTIP_WIDTH = 240,
+    STATS_TOOLTIP_HEIGHT = 280,
+    BUFF_TOOLTIP_WIDTH = 260,
+    BUFF_TOOLTIP_HEIGHT = 80,
+    
+    -- Color Thresholds
+    HEALTH_HIGH = 0.75,
+    HEALTH_MID = 0.5,
+    POWER_HIGH = 0.75,
+    POWER_MID = 0.5,
+};
+
+-- Color Palette
+COLORS = {
+    TRANSPARENT = Turbine.UI.Color(0, 0, 0, 0),
+    BLACK = Turbine.UI.Color(1, 0, 0, 0),
+    
+    HEALTH_HIGH = Turbine.UI.Color(1, 0.1, 0.85, 0.1),
+    HEALTH_MID = Turbine.UI.Color(1, 1.0, 0.85, 0.1),
+    HEALTH_LOW = Turbine.UI.Color(1, 0.9, 0.15, 0.1),
+    HEALTH_BG = Turbine.UI.Color(0.2, 0.4, 0.4, 0.4),
+    
+    POWER_HIGH = Turbine.UI.Color(1, 0.2, 0.5, 0.9),
+    POWER_MID = Turbine.UI.Color(1, 1.0, 0.85, 0.1),
+    POWER_LOW = Turbine.UI.Color(1, 0.9, 0.15, 0.1),
+    POWER_BG = Turbine.UI.Color(0.2, 0.2, 0.2, 0.4),
+    
+    TOOLTIP_BG = Turbine.UI.Color(0.92, 0.05, 0.05, 0.12),
+    TOOLTIP_TITLE = Turbine.UI.Color(1, 1.0, 0.85, 0.4),
+    TOOLTIP_TEXT = Turbine.UI.Color(1, 0.9, 0.9, 0.9),
+    
+    TEXT_HEALTH = Turbine.UI.Color(1, 0.2, 1.0, 0.2),
+    TEXT_POWER = Turbine.UI.Color(1, 0.2, 0.6, 1.0),
+    TEXT_WHITE = Turbine.UI.Color(1, 1, 1, 1),
+    TEXT_GRAY = Turbine.UI.Color(0.8, 0.8, 0.8, 0.8),
+};
+
+-- Debuff Keywords
+DEBUFF_KEYWORDS = {
+    "bleed", "wound", "poison", "disease", "fear", "dread",
+    "stun", "daze", "root", "slow", "debuff", "curse",
+    "fire", "acid", "shadow", "corruption", "dot", "drain"
+};
+
 -- Polyfill: define class() if the Turbine environment doesn't expose it
 if type(class) ~= "function" then
     function class(baseClass)
@@ -30,187 +95,260 @@ if type(class) ~= "function" then
 end
 
 -- =========================================================================
+-- HELPER FUNCTIONS
+-- =========================================================================
+function CreateLabel(parent, x, y, w, h, font, color, alignment)
+    local label = Turbine.UI.Label();
+    label:SetParent(parent);
+    label:SetPosition(x, y);
+    label:SetSize(w, h);
+    label:SetFont(font or Turbine.UI.Lotro.Font.Verdana14);
+    label:SetForeColor(color or COLORS.TEXT_WHITE);
+    label:SetTextAlignment(alignment or Turbine.UI.ContentAlignment.TopLeft);
+    label:SetMouseVisible(false);
+    return label;
+end
+
+function CreateTooltipWindow(width, height)
+    local tooltip = Turbine.UI.Window();
+    tooltip:SetSize(width, height);
+    tooltip:SetBackColor(COLORS.TOOLTIP_BG);
+    tooltip:SetVisible(false);
+    tooltip:SetZOrder(500);
+    tooltip:SetMouseVisible(false);
+    tooltip:SetOpacity(1);
+    tooltip:SetText("");
+    return tooltip;
+end
+
+function FormatTime(seconds)
+    if seconds <= 0 then return ""; end
+    
+    local mins = math.floor(seconds / 60);
+    local secs = math.floor(seconds % 60);
+    
+    if mins > 60 then
+        return string.format("%dh", math.floor(mins / 60));
+    elseif mins > 0 then
+        return string.format("%d:%02d", mins, secs);
+    else
+        return string.format("%ds", secs);
+    end
+end
+
+function GetColorForPercentage(pct, highColor, midColor, lowColor, highThreshold, midThreshold)
+    if pct >= highThreshold then
+        return highColor, 3;
+    elseif pct >= midThreshold then
+        return midColor, 2;
+    else
+        return lowColor, 1;
+    end
+end
+
+function SafeCall(func, default)
+    local ok, result = pcall(func);
+    return (ok and result) or default;
+end
+
+-- =========================================================================
 -- HealthBarWindow
 -- =========================================================================
 HealthBarWindow = class(Turbine.UI.Window);
 
 function HealthBarWindow:Constructor()
     Turbine.UI.Window.Constructor(self);
-
     self:SetVisible(true);
 
-    -- Get the local player
+    -- Initialize state
     self.player = Turbine.Gameplay.LocalPlayer:GetInstance();
     self.isUnlocked = false;
     self.rebuildNeeded = false;
     self.rebuilding = false;
+    self.firstBuild = true;
 
-    -- =====================
-    -- DEFAULT BAR SETTINGS
-    -- =====================
+    -- Initialize default settings
+    self:InitializeDefaultSettings();
+    
+    -- Load saved settings
+    self:LoadSettings();
+
+    -- Setup combat tracking
+    self:InitializeCombatTracking();
+
+    -- Create UI components
+    self:CreateBuffPanel();
+    self:RebuildBars();
+    self.firstBuild = false;
+    
+    self:CreateDragOverlay();
+    self:CreateSettingsPanel();
+    self:CreateAlertLabel();
+    
+    -- Default to locked
+    self:SetUnlocked(false);
+
+    -- Setup event listeners
+    self:SetupEventListeners();
+    self:SetupKeyListener();
+    self:SetupUpdateTimer();
+
+    -- Initial update
+    self:UpdateHealth();
+    self:UpdatePower();
+    self:RefreshBuffList();
+end
+
+function HealthBarWindow:InitializeDefaultSettings()
     self.numSegments = 100;
     self.curveDepth = 50;
     self.barHeightTotal = 250;
     self.centerGap = 300;
     self.segThickness = 15;
-    self.combatOpacity = 50;   -- percent (0-100)
-    self.oocOpacity = 5;       -- percent (0-100)
+    self.combatOpacity = 50;
+    self.oocOpacity = 5;
+end
 
-    -- Load saved settings
-    self:LoadSettings();
-
-    -- Combat state
+function HealthBarWindow:InitializeCombatTracking()
     self.inCombat = self.player:IsInCombat();
-    self.targetOpacity = self.inCombat and (self.combatOpacity / 100) or (self.oocOpacity / 100);
+    self.targetOpacity = self.inCombat 
+        and (self.combatOpacity / 100) 
+        or (self.oocOpacity / 100);
     self:SetOpacity(self.targetOpacity);
+end
 
-    -- Create buff panel BEFORE first build so RebuildBars can position it
+function HealthBarWindow:CreateBuffPanel()
     self.buffRows = {};
     self.activeBuffs = {};
     self.buffPanel = Turbine.UI.Control();
     self.buffPanel:SetParent(self);
     self.buffPanel:SetMouseVisible(false);
     self.buffPanel:SetZOrder(50);
+end
 
-    -- Build the bars (first build includes position loading)
-    self.firstBuild = true;
-    self:RebuildBars();
-    self.firstBuild = false;
+function HealthBarWindow:SetupEventListeners()
+    local win = self;
+    
+    -- Flag-based updates: events mark dirty, ProcessUpdateTick handles once per tick
+    self.healthDirty = false;
+    self.powerDirty = false;
+    self.player.MoraleChanged = function() win.healthDirty = true; end;
+    self.player.MaxMoraleChanged = function() win.healthDirty = true; end;
+    self.player.PowerChanged = function() win.powerDirty = true; end;
+    self.player.MaxPowerChanged = function() win.powerDirty = true; end;
+    self.player.InCombatChanged = function()
+        win.inCombat = win.player:IsInCombat();
+        win.targetOpacity = win.inCombat 
+            and (win.combatOpacity / 100) 
+            or (win.oocOpacity / 100);
+    end;
+    
+    self.PositionChanged = function()
+        if not win.rebuilding then
+            win:SavePosition();
+        end
+    end;
+    
+    -- Buff events update directly
+    local effects = self.player:GetEffects();
+    if effects then
+        effects.EffectAdded = function(sender, args)
+            win:OnEffectAdded(args);
+            win:RefreshBuffList();
+        end;
+        effects.EffectRemoved = function()
+            win:RefreshBuffList();
+        end;
+    end
+end
 
-    -- =====================
-    -- DRAG OVERLAY (visible only when unlocked via Ctrl+\)
-    -- =====================
-    self:CreateDragOverlay();
-
-    -- =====================
-    -- SETTINGS PANEL (visible only when unlocked)
-    -- =====================
-    self:CreateSettingsPanel();
-
-    -- =====================
-    -- STATS TOOLTIP (hover over bars to see stats)
-    -- =====================
-    self:CreateStatsTooltip();
-
-    -- Default to locked
-    self:SetUnlocked(false);
-
-    -- =====================
-    -- GLOBAL KEY LISTENER for Ctrl+\ (Reposition UI)
-    -- =====================
+function HealthBarWindow:SetupKeyListener()
+    local win = self;
     self.keyListener = Turbine.UI.Control();
     self.keyListener:SetWantsKeyEvents(true);
-    local win = self;
     self.keyListener.KeyDown = function(sender, args)
         -- 0x1000007B is the "Reposition UI" action (Ctrl+\)
-        if (args.Action == 0x1000007B) then
+        if args.Action == 0x1000007B then
             win:SetUnlocked(not win.isUnlocked);
         end
     end;
+end
 
-    -- =====================
-    -- EVENT HOOKS
-    -- =====================
-    self.player.MoraleChanged = function(sender, args)
-        self:UpdateHealth();
-    end;
-    self.player.MaxMoraleChanged = function(sender, args)
-        self:UpdateHealth();
-    end;
-    self.player.PowerChanged = function(sender, args)
-        self:UpdatePower();
-    end;
-    self.player.MaxPowerChanged = function(sender, args)
-        self:UpdatePower();
-    end;
-    self.PositionChanged = function(sender, args)
-        if not self.rebuilding then
-            self:SavePosition();
-        end
-    end;
-
-    -- Combat state tracking
-    self.player.InCombatChanged = function(sender, args)
-        self.inCombat = self.player:IsInCombat();
-        self.targetOpacity = self.inCombat and (self.combatOpacity / 100) or (self.oocOpacity / 100);
-    end;
-
-    -- =====================
-    -- ALERT SYSTEM
-    -- =====================
+function HealthBarWindow:SetupUpdateTimer()
+    local win = self;
     self.alertQueue = {};
     self.alertTimer = 0;
     self.alertShowing = false;
     self.lowHealthAlerted = false;
     self.lowPowerAlerted = false;
-    self:CreateAlertLabel();
-
-    -- =====================
-    -- DEBUFF / EFFECT WATCHER & BUFF BAR
-    -- =====================
-
-    local effects = self.player:GetEffects();
-    if effects then
-        effects.EffectAdded = function(sender, args)
-            self:OnEffectAdded(args);
-            self:RefreshBuffList();
-        end;
-        effects.EffectRemoved = function(sender, args)
-            self:RefreshBuffList();
-        end;
-    end;
-
-    -- Initial update
-    self:UpdateHealth();
-    self:UpdatePower();
-    self:RefreshBuffList();
-
-    -- Periodic timer for missed events AND live preview rebuilds
+    
+    self.startupTicks = 10;
+    
     self.updateTimer = Turbine.UI.Control();
     self.updateTimer:SetWantsUpdates(true);
-    self.updateTimer.accumulator = 0;
-    self.updateTimer.buffTick = 0;
+    
     self.updateTimer.Update = function(sender, args)
-        -- Live preview: rebuild with throttle (at most once per 8 ticks ~0.5s)
-        if win.rebuildNeeded then
-            if not win.rebuildCooldown or win.rebuildCooldown <= 0 then
-                win.rebuildNeeded = false;
-                win.rebuildCooldown = 8;
-                win:RebuildBars();
-            else
-                win.rebuildCooldown = win.rebuildCooldown - 1;
-            end
-        end
-
-        -- Smooth opacity fade for combat/out-of-combat
-        local curOp = win:GetOpacity();
-        if math.abs(curOp - win.targetOpacity) > 0.01 then
-            if curOp < win.targetOpacity then
-                win:SetOpacity(math.min(curOp + 0.05, win.targetOpacity));
-            else
-                win:SetOpacity(math.max(curOp - 0.02, win.targetOpacity));
-            end
-        end
-
-        -- Buff Timer (every 10 ticks ~0.3s)
-        if not sender.buffTick then sender.buffTick = 0; end
-        sender.buffTick = sender.buffTick + 1;
-        if sender.buffTick >= 10 then
-            sender.buffTick = 0;
-            win:UpdateBuffTimers();
-        end
-
-        -- Periodic health/power refresh
-        sender.accumulator = sender.accumulator + 1;
-        if sender.accumulator >= 30 then
-            sender.accumulator = 0;
-            win:UpdateHealth();
-            win:UpdatePower();
-        end
-
-        -- Alert fade/queue processing
-        win:ProcessAlerts();
+        win:ProcessUpdateTick(sender);
     end;
+end
+
+function HealthBarWindow:ProcessUpdateTick(sender)
+    -- Startup retry: force full update until player data is available
+    if self.startupTicks and self.startupTicks > 0 then
+        self.startupTicks = self.startupTicks - 1;
+        self.lastHealthPct = nil;
+        self.lastHealthTier = nil;
+        self.lastPowerPct = nil;
+        self.lastPowerTier = nil;
+        self.healthDirty = true;
+        self.powerDirty = true;
+        if self.startupTicks <= 0 then
+            self.startupTicks = nil;
+        end
+    end
+
+    -- Handle rebuild throttling
+    if self.rebuildNeeded then
+        if not self.rebuildCooldown or self.rebuildCooldown <= 0 then
+            self.rebuildNeeded = false;
+            self.rebuildCooldown = CONSTANTS.REBUILD_COOLDOWN_TICKS;
+            self:RebuildBars();
+        else
+            self.rebuildCooldown = self.rebuildCooldown - 1;
+        end
+    end
+
+    -- Process dirty flags (coalesces rapid events into one update per tick)
+    if self.healthDirty then
+        self.healthDirty = false;
+        self:UpdateHealth();
+    end
+    if self.powerDirty then
+        self.powerDirty = false;
+        self:UpdatePower();
+    end
+
+    -- Smooth opacity transitions every tick
+    local curOp = self:GetOpacity();
+    if math.abs(curOp - self.targetOpacity) > 0.01 then
+        if curOp < self.targetOpacity then
+            self:SetOpacity(math.min(curOp + 0.05, self.targetOpacity));
+        else
+            self:SetOpacity(math.max(curOp - 0.02, self.targetOpacity));
+        end
+    end
+
+    -- Update buff timers every tick
+    self:UpdateBuffTimers();
+
+    -- Alert processing every tick
+    if self.alertShowing or #self.alertQueue > 0 then
+        self:ProcessAlerts();
+    end
+end
+
+function HealthBarWindow:UpdateOpacityTransition()
+    -- This method is no longer needed, handled inline in ProcessUpdateTick
 end
 
 -- =========================================================================
@@ -219,154 +357,164 @@ end
 function HealthBarWindow:RebuildBars()
     self.rebuilding = true;
 
-    local totalWidth = self.centerGap + (self.curveDepth * 2) + 400;
-    local barAreaHeight = self.barHeightTotal + 60;
-
-    -- Calculate buff area height based on how many rows we need
-    local BUFF_ICON_SIZE = 36;
-    local BUFF_SPACING = 4;
-    local BUFF_ROW_HEIGHT = BUFF_ICON_SIZE + 18; -- icon + timer text
-    local iconsPerRow = math.floor((totalWidth + BUFF_SPACING) / (BUFF_ICON_SIZE + BUFF_SPACING));
-    if iconsPerRow < 1 then iconsPerRow = 1; end
-    self.buffIconsPerRow = iconsPerRow;
-
-    -- Estimate rows needed (use cached count or default to 1 row)
-    local buffCount = self.lastBuffCount or 0;
-    local numRows = math.ceil(buffCount / iconsPerRow);
-    if numRows < 1 then numRows = 1; end
-    local buffHeight = numRows * (BUFF_ROW_HEIGHT + BUFF_SPACING) + 4;
-    if buffHeight < BUFF_ROW_HEIGHT + 8 then buffHeight = BUFF_ROW_HEIGHT + 8; end
-
-    local totalHeight = barAreaHeight + buffHeight;
-
-    self:SetSize(totalWidth, totalHeight);
-    self:SetBackColor(Turbine.UI.Color(0, 0, 0, 0));
+    local dimensions = self:CalculateDimensions();
+    self:SetSize(dimensions.totalWidth, dimensions.totalHeight);
+    self:SetBackColor(COLORS.TRANSPARENT);
     self:SetText("");
 
-    -- Configure Buff Panel Position (centered below bars)
-    if self.buffPanel then
-        local panelW = totalWidth;
-        self.buffPanel:SetSize(panelW, buffHeight);
-        self.buffPanel:SetPosition(0, barAreaHeight);
-        self.buffPanel:SetZOrder(50);
-    end
+    -- Configure buff panel
+    self:PositionBuffPanel(dimensions);
 
-    -- Only load/set position on the very first build
+    -- Load position on first build
     if self.firstBuild then
-        local screenWidth = Turbine.UI.Display:GetWidth();
-        local screenHeight = Turbine.UI.Display:GetHeight();
-        local pos = Turbine.PluginData.Load(Turbine.DataScope.Character, "EasyHealthBarPos");
-        if pos and pos.x and pos.y then
-            self:SetPosition(pos.x, pos.y);
-        else
-            self:SetPosition(
-                math.floor((screenWidth - totalWidth) / 2),
-                math.floor((screenHeight - totalHeight) / 2)
-            );
-        end
+        self:LoadPosition(dimensions.totalWidth, dimensions.totalHeight);
     end
 
-    local centerX = totalWidth / 2;
+    -- Build bar segments
+    local centerX = dimensions.totalWidth / 2;
     local leftBase = centerX - (self.centerGap / 2);
     local rightBase = centerX + (self.centerGap / 2);
 
-    -- Reuse or create segments (pool-based)
-    self.healthBGSegments = self:UpdateVerticalCurve(self.healthBGSegments, leftBase, Turbine.UI.Color(0.2, 0.4, 0.4, 0.4), false, -1);
-    self.healthFillSegments = self:UpdateVerticalCurve(self.healthFillSegments, leftBase, Turbine.UI.Color(1, 0.1, 0.7, 0.1), true, -1);
-    self.powerBGSegments = self:UpdateVerticalCurve(self.powerBGSegments, rightBase, Turbine.UI.Color(0.2, 0.2, 0.2, 0.4), false, 1);
-    self.powerFillSegments = self:UpdateVerticalCurve(self.powerFillSegments, rightBase, Turbine.UI.Color(1, 0.2, 0.5, 0.9), true, 1);
+    self:RebuildBarSegments(leftBase, rightBase);
+    self:RebuildTextLabels(leftBase, rightBase, dimensions.barAreaHeight);
+    self:RepositionUIElements(dimensions);
 
-    -- Create or reuse text labels
-    local font = Turbine.UI.Lotro.Font.TrajanProBold24;
-    local labelWidth = 200;
-    local labelHeight = 30;
-
-    if not self.healthTextShadow then
-        self.healthTextShadow = Turbine.UI.Label();
-        self.healthTextShadow:SetParent(self);
-    end
-    self.healthTextShadow:SetFont(font);
-    self.healthTextShadow:SetForeColor(Turbine.UI.Color(1, 0, 0, 0));
-    self.healthTextShadow:SetTextAlignment(Turbine.UI.ContentAlignment.MiddleRight);
-    self.healthTextShadow:SetSize(labelWidth, labelHeight);
-    self.healthTextShadow:SetPosition(leftBase - labelWidth - self.curveDepth - 10 + 2, (barAreaHeight / 2) - 15 + 2);
-    self.healthTextShadow:SetZOrder(9);
-    self.healthTextShadow:SetMouseVisible(false);
-
-    if not self.healthText then
-        self.healthText = Turbine.UI.Label();
-        self.healthText:SetParent(self);
-    end
-    self.healthText:SetFont(font);
-    self.healthText:SetForeColor(Turbine.UI.Color(1, 0.2, 1.0, 0.2));
-    self.healthText:SetTextAlignment(Turbine.UI.ContentAlignment.MiddleRight);
-    self.healthText:SetSize(labelWidth, labelHeight);
-    self.healthText:SetPosition(leftBase - labelWidth - self.curveDepth - 10, (barAreaHeight / 2) - 15);
-    self.healthText:SetZOrder(10);
-    self.healthText:SetMouseVisible(false);
-
-    if not self.powerTextShadow then
-        self.powerTextShadow = Turbine.UI.Label();
-        self.powerTextShadow:SetParent(self);
-    end
-    self.powerTextShadow:SetFont(font);
-    self.powerTextShadow:SetForeColor(Turbine.UI.Color(1, 0, 0, 0));
-    self.powerTextShadow:SetTextAlignment(Turbine.UI.ContentAlignment.MiddleLeft);
-    self.powerTextShadow:SetSize(labelWidth, labelHeight);
-    self.powerTextShadow:SetPosition(rightBase + self.curveDepth + 10 + 2, (barAreaHeight / 2) - 15 + 2);
-    self.powerTextShadow:SetZOrder(9);
-    self.powerTextShadow:SetMouseVisible(false);
-
-    if not self.powerText then
-        self.powerText = Turbine.UI.Label();
-        self.powerText:SetParent(self);
-    end
-    self.powerText:SetFont(font);
-    self.powerText:SetForeColor(Turbine.UI.Color(1, 0.2, 0.6, 1.0));
-    self.powerText:SetTextAlignment(Turbine.UI.ContentAlignment.MiddleLeft);
-    self.powerText:SetSize(labelWidth, labelHeight);
-    self.powerText:SetPosition(rightBase + self.curveDepth + 10, (barAreaHeight / 2) - 15);
-    self.powerText:SetZOrder(10);
-    self.powerText:SetMouseVisible(false);
-
-    -- Reposition instruction labels after rebuild
-    if self.dragLabel then
-        self.dragLabel:SetPosition((totalWidth / 2) - 150, (barAreaHeight / 2) - 55);
-        self.dragLabel:SetZOrder(200);
-    end
-    if self.lockLabel then
-        self.lockLabel:SetPosition((totalWidth / 2) - 150, (barAreaHeight / 2) - 25);
-        self.lockLabel:SetZOrder(200);
-    end
-
-    -- Reposition alert label (at bottom of bar area, above buff row)
-    if self.alertLabel then
-        self.alertLabel:SetPosition((totalWidth / 2) - 200, barAreaHeight - 35);
-    end
-    if self.alertShadow then
-        self.alertShadow:SetPosition((totalWidth / 2) - 200 + 2, barAreaHeight - 35 + 2);
-    end
-
-    if self.isUnlocked then
-        self:SetMouseVisible(true);
-    end
-
-    -- Reposition stats hover zone
-    if self.statsHoverZone then
-        self.statsHoverZone:SetSize(totalWidth, barAreaHeight);
-        self.statsHoverZone:SetPosition(0, 0);
-    end
-
-    -- Force a full update (reset cached state)
+    -- Force full update
     self.lastHealthPct = -1;
     self.lastPowerPct = -1;
     self:UpdateHealth();
     self:UpdatePower();
-
-    -- Refresh buff layout after bars are built
     self:RefreshBuffList();
 
     self.rebuilding = false;
+end
+
+function HealthBarWindow:CalculateDimensions()
+    local totalWidth = self.centerGap + (self.curveDepth * 2) + 400;
+    local barAreaHeight = self.barHeightTotal + 60;
+
+    -- Calculate buff area dimensions
+    local iconsPerRow = math.floor((totalWidth + CONSTANTS.BUFF_SPACING) / 
+                                   (CONSTANTS.BUFF_ICON_SIZE + CONSTANTS.BUFF_SPACING));
+    if iconsPerRow < 1 then iconsPerRow = 1; end
+    self.buffIconsPerRow = iconsPerRow;
+
+    local buffCount = self.lastBuffCount or 0;
+    local numRows = math.ceil(buffCount / iconsPerRow);
+    if numRows < 1 then numRows = 1; end
+    
+    local buffHeight = numRows * (CONSTANTS.BUFF_ROW_HEIGHT + CONSTANTS.BUFF_SPACING) + 4;
+    if buffHeight < CONSTANTS.BUFF_ROW_HEIGHT + 8 then 
+        buffHeight = CONSTANTS.BUFF_ROW_HEIGHT + 8; 
+    end
+
+    return {
+        totalWidth = totalWidth,
+        totalHeight = barAreaHeight + buffHeight,
+        barAreaHeight = barAreaHeight,
+        buffHeight = buffHeight,
+        iconsPerRow = iconsPerRow
+    };
+end
+
+function HealthBarWindow:PositionBuffPanel(dimensions)
+    if self.buffPanel then
+        self.buffPanel:SetSize(dimensions.totalWidth, dimensions.buffHeight);
+        self.buffPanel:SetPosition(0, dimensions.barAreaHeight);
+        self.buffPanel:SetZOrder(50);
+    end
+end
+
+function HealthBarWindow:LoadPosition(width, height)
+    local screenWidth = Turbine.UI.Display:GetWidth();
+    local screenHeight = Turbine.UI.Display:GetHeight();
+    local pos = Turbine.PluginData.Load(Turbine.DataScope.Character, "EasyHealthBarPos");
+    
+    if pos and pos.x and pos.y then
+        self:SetPosition(pos.x, pos.y);
+    else
+        self:SetPosition(
+            math.floor((screenWidth - width) / 2),
+            math.floor((screenHeight - height) / 2)
+        );
+    end
+end
+
+function HealthBarWindow:RebuildBarSegments(leftBase, rightBase)
+    self.healthBGSegments = self:UpdateVerticalCurve(
+        self.healthBGSegments, leftBase, COLORS.HEALTH_BG, false, -1);
+    self.healthFillSegments = self:UpdateVerticalCurve(
+        self.healthFillSegments, leftBase, COLORS.HEALTH_HIGH, true, -1);
+    self.powerBGSegments = self:UpdateVerticalCurve(
+        self.powerBGSegments, rightBase, COLORS.POWER_BG, false, 1);
+    self.powerFillSegments = self:UpdateVerticalCurve(
+        self.powerFillSegments, rightBase, COLORS.POWER_HIGH, true, 1);
+end
+
+function HealthBarWindow:RebuildTextLabels(leftBase, rightBase, barAreaHeight)
+    local font = Turbine.UI.Lotro.Font.TrajanProBold24;
+    local labelY = (barAreaHeight / 2) - 15;
+
+    -- Health text (right-aligned, left side)
+    local healthX = leftBase - CONSTANTS.LABEL_WIDTH - self.curveDepth - 10;
+    self.healthTextShadow = self:CreateOrUpdateLabel(
+        self.healthTextShadow, healthX + 2, labelY + 2, 
+        font, COLORS.BLACK, Turbine.UI.ContentAlignment.MiddleRight, 9);
+    self.healthText = self:CreateOrUpdateLabel(
+        self.healthText, healthX, labelY, 
+        font, COLORS.TEXT_HEALTH, Turbine.UI.ContentAlignment.MiddleRight, 10);
+
+    -- Power text (left-aligned, right side)
+    local powerX = rightBase + self.curveDepth + 10;
+    self.powerTextShadow = self:CreateOrUpdateLabel(
+        self.powerTextShadow, powerX + 2, labelY + 2, 
+        font, COLORS.BLACK, Turbine.UI.ContentAlignment.MiddleLeft, 9);
+    self.powerText = self:CreateOrUpdateLabel(
+        self.powerText, powerX, labelY, 
+        font, COLORS.TEXT_POWER, Turbine.UI.ContentAlignment.MiddleLeft, 10);
+end
+
+function HealthBarWindow:CreateOrUpdateLabel(label, x, y, font, color, alignment, zOrder)
+    if not label then
+        label = Turbine.UI.Label();
+        label:SetParent(self);
+    end
+    label:SetFont(font);
+    label:SetForeColor(color);
+    label:SetTextAlignment(alignment);
+    label:SetSize(CONSTANTS.LABEL_WIDTH, CONSTANTS.LABEL_HEIGHT);
+    label:SetPosition(x, y);
+    label:SetZOrder(zOrder);
+    label:SetMouseVisible(false);
+    return label;
+end
+
+function HealthBarWindow:RepositionUIElements(dimensions)
+    local centerX = dimensions.totalWidth / 2;
+    local centerY = dimensions.barAreaHeight / 2;
+
+    -- Drag labels
+    if self.dragLabel then
+        self.dragLabel:SetPosition(centerX - 150, centerY - 55);
+        self.dragLabel:SetZOrder(200);
+    end
+    if self.lockLabel then
+        self.lockLabel:SetPosition(centerX - 150, centerY - 25);
+        self.lockLabel:SetZOrder(200);
+    end
+
+    -- Alert labels
+    if self.alertLabel then
+        self.alertLabel:SetPosition(centerX - 200, dimensions.barAreaHeight - 35);
+    end
+    if self.alertShadow then
+        self.alertShadow:SetPosition(centerX - 200 + 2, dimensions.barAreaHeight - 35 + 2);
+    end
+
+    -- Ensure unlocked state is correct
+    if self.isUnlocked then
+        self:SetMouseVisible(true);
+    end
 end
 
 -- Resize a segment pool: reuse existing controls, create new ones if needed, hide extras
@@ -412,127 +560,6 @@ function HealthBarWindow:UpdateVerticalCurve(pool, xBase, color, isFill, directi
     end
 
     return pool;
-end
-
--- =========================================================================
--- STATS TOOLTIP (hover over bar area to see character stats)
--- =========================================================================
-function HealthBarWindow:CreateStatsTooltip()
-    local win = self;
-
-    -- Invisible hover zone that covers the bar area
-    self.statsHoverZone = Turbine.UI.Control();
-    self.statsHoverZone:SetParent(self);
-    self.statsHoverZone:SetBackColor(Turbine.UI.Color(0, 0, 0, 0));
-    self.statsHoverZone:SetMouseVisible(true);
-    self.statsHoverZone:SetZOrder(5); -- below bar segments (they have mouse off), above nothing
-
-    -- The tooltip window itself (top-level so it can overflow)
-    self.statsWindow = Turbine.UI.Window();
-    self.statsWindow:SetSize(240, 280);
-    self.statsWindow:SetBackColor(Turbine.UI.Color(0.92, 0.05, 0.05, 0.12));
-    self.statsWindow:SetVisible(false);
-    self.statsWindow:SetZOrder(600);
-    self.statsWindow:SetMouseVisible(false);
-    self.statsWindow:SetOpacity(1);
-    self.statsWindow:SetText("");
-
-    -- Title
-    self.statsTitle = Turbine.UI.Label();
-    self.statsTitle:SetParent(self.statsWindow);
-    self.statsTitle:SetSize(232, 24);
-    self.statsTitle:SetPosition(4, 4);
-    self.statsTitle:SetFont(Turbine.UI.Lotro.Font.Verdana16);
-    self.statsTitle:SetForeColor(Turbine.UI.Color(1, 1.0, 0.85, 0.4));
-    self.statsTitle:SetTextAlignment(Turbine.UI.ContentAlignment.TopCenter);
-    self.statsTitle:SetMouseVisible(false);
-    self.statsTitle:SetText("Character Stats");
-
-    -- Stats body
-    self.statsBody = Turbine.UI.Label();
-    self.statsBody:SetParent(self.statsWindow);
-    self.statsBody:SetSize(232, 248);
-    self.statsBody:SetPosition(4, 28);
-    self.statsBody:SetFont(Turbine.UI.Lotro.Font.Verdana14);
-    self.statsBody:SetForeColor(Turbine.UI.Color(1, 0.9, 0.9, 0.9));
-    self.statsBody:SetTextAlignment(Turbine.UI.ContentAlignment.TopLeft);
-    self.statsBody:SetMouseVisible(false);
-
-    -- Hover events on the zone
-    self.statsHoverZone.MouseEnter = function(sender, args)
-        if win.isUnlocked then return; end -- Don't show when dragging
-        win:UpdateStatsTooltip();
-        -- Position near the center of the window
-        local wx, wy = win:GetPosition();
-        local ww, wh = win:GetSize();
-        win.statsWindow:SetPosition(wx + (ww / 2) - 120, wy - 290);
-        win.statsWindow:SetVisible(true);
-    end;
-    self.statsHoverZone.MouseLeave = function(sender, args)
-        win.statsWindow:SetVisible(false);
-    end;
-end
-
-function HealthBarWindow:UpdateStatsTooltip()
-    local p = self.player;
-    local lines = {};
-
-    -- Morale / Power
-    local morale = p:GetMorale() or 0;
-    local maxMorale = p:GetMaxMorale() or 1;
-    local power = p:GetPower() or 0;
-    local maxPower = p:GetMaxPower() or 1;
-    table.insert(lines, string.format("Morale: %d / %d", morale, maxMorale));
-    table.insert(lines, string.format("Power:  %d / %d", power, maxPower));
-    table.insert(lines, "");
-
-    -- Base Attributes via GetAttributes()
-    local ok, attrs = pcall(function() return p:GetAttributes() end);
-    if ok and attrs then
-        local function getStat(fn)
-            local s, v = pcall(fn);
-            return (s and v) or "?";
-        end
-
-        if attrs.GetMight then
-            table.insert(lines, "Might:    " .. tostring(getStat(function() return attrs:GetMight() end)));
-        end
-        if attrs.GetAgility then
-            table.insert(lines, "Agility:  " .. tostring(getStat(function() return attrs:GetAgility() end)));
-        end
-        if attrs.GetVitality then
-            table.insert(lines, "Vitality: " .. tostring(getStat(function() return attrs:GetVitality() end)));
-        end
-        if attrs.GetWill then
-            table.insert(lines, "Will:     " .. tostring(getStat(function() return attrs:GetWill() end)));
-        end
-        if attrs.GetFate then
-            table.insert(lines, "Fate:     " .. tostring(getStat(function() return attrs:GetFate() end)));
-        end
-        table.insert(lines, "");
-
-        -- Ratings
-        if attrs.GetCriticalRating then
-            table.insert(lines, "Critical:   " .. tostring(getStat(function() return attrs:GetCriticalRating() end)));
-        end
-        if attrs.GetPhysicalMastery then
-            table.insert(lines, "Phys Mast:  " .. tostring(getStat(function() return attrs:GetPhysicalMastery() end)));
-        end
-        if attrs.GetTacticalMastery then
-            table.insert(lines, "Tact Mast:  " .. tostring(getStat(function() return attrs:GetTacticalMastery() end)));
-        end
-        if attrs.GetArmour then
-            table.insert(lines, "Armour:     " .. tostring(getStat(function() return attrs:GetArmour() end)));
-        end
-        if attrs.GetResistance then
-            table.insert(lines, "Resistance: " .. tostring(getStat(function() return attrs:GetResistance() end)));
-        end
-    else
-        -- Fallback: try individual methods on player directly
-        table.insert(lines, "Level: " .. tostring(p:GetLevel() or "?"));
-    end
-
-    self.statsBody:SetText(table.concat(lines, "\n"));
 end
 
 function HealthBarWindow:DestroySegments()
@@ -767,157 +794,102 @@ end
 -- UPDATE METHODS
 -- =========================================================================
 function HealthBarWindow:UpdateHealth()
-    if not self.healthFillSegments then return; end
-
-    local morale = self.player:GetMorale();
-    local maxMorale = self.player:GetMaxMorale();
-
-    if maxMorale == nil or maxMorale == 0 then maxMorale = 1; end
-    if morale == nil then morale = 0; end
-
-    local pct = morale / maxMorale;
-    if pct > 1 then pct = 1; end
-    if pct < 0 then pct = 0; end
-
-    -- Skip if nothing changed (within 0.1% tolerance)
-    local pctInt = math.floor(pct * 1000);
-    if self.lastHealthPct == pctInt then return; end
-
-    local oldStartIdx = 0;
-    if self.lastHealthPct and self.lastHealthPct >= 0 then
-        local oldPct = self.lastHealthPct / 1000;
-        local oldVisible = math.floor(self.numSegments * oldPct);
-        oldStartIdx = self.numSegments - oldVisible + 1;
-    end
-    self.lastHealthPct = pctInt;
-
-    local r, g, b;
-    local colorTier;
-    if pct >= 0.75 then
-        r = 0.1; g = 0.85; b = 0.1; colorTier = 3;
-    elseif pct >= 0.5 then
-        r = 1.0; g = 0.85; b = 0.1; colorTier = 2;
-    else
-        r = 0.9; g = 0.15; b = 0.1; colorTier = 1;
-    end
-    local color = Turbine.UI.Color(1, r, g, b);
-
-    -- Detect if color tier changed — if so, recolor ALL visible segments
-    local tierChanged = (self.lastHealthTier ~= nil and self.lastHealthTier ~= colorTier);
-    self.lastHealthTier = colorTier;
-
-    local visibleCount = math.floor(self.numSegments * pct);
-    local startIdx = self.numSegments - visibleCount + 1;
-
-    -- Full recolor if tier changed, otherwise delta-only
-    local lo, hi;
-    if tierChanged or oldStartIdx == 0 then
-        lo = startIdx; hi = self.numSegments;
-    else
-        lo = math.min(startIdx, oldStartIdx);
-        hi = math.max(startIdx, oldStartIdx);
-    end
-
-    for i = lo, hi do
-        local seg = self.healthFillSegments[i];
-        if seg then
-            if i >= startIdx then
-                seg:SetVisible(true);
-                seg:SetBackColor(color);
-            else
-                seg:SetVisible(false);
-            end
-        end
-    end
-
-    local txt = tostring(math.floor(pct * 100)) .. "%";
-    if self.healthText then self.healthText:SetText(txt); end
-    if self.healthTextShadow then self.healthTextShadow:SetText(txt); end
-
-    -- Low health alert
-    if pct < 0.3 and not self.lowHealthAlerted then
-        self.lowHealthAlerted = true;
-        self:ShowAlert("LOW HEALTH!", Turbine.UI.Color(1, 1.0, 0.2, 0.2));
-    elseif pct >= 0.3 then
-        self.lowHealthAlerted = false;
-    end
+    self:UpdateBar(
+        self.healthFillSegments,
+        self.player:GetMorale(),
+        self.player:GetMaxMorale(),
+        COLORS.HEALTH_HIGH, COLORS.HEALTH_MID, COLORS.HEALTH_LOW,
+        CONSTANTS.HEALTH_HIGH, CONSTANTS.HEALTH_MID,
+        "lastHealthPct", "lastHealthTier",
+        self.healthText, self.healthTextShadow,
+        "lowHealthAlerted", "LOW HEALTH!", Turbine.UI.Color(1, 1.0, 0.2, 0.2)
+    );
 end
 
 function HealthBarWindow:UpdatePower()
-    if not self.powerFillSegments then return; end
+    self:UpdateBar(
+        self.powerFillSegments,
+        self.player:GetPower(),
+        self.player:GetMaxPower(),
+        COLORS.POWER_HIGH, COLORS.POWER_MID, COLORS.POWER_LOW,
+        CONSTANTS.POWER_HIGH, CONSTANTS.POWER_MID,
+        "lastPowerPct", "lastPowerTier",
+        self.powerText, self.powerTextShadow,
+        "lowPowerAlerted", "LOW POWER!", Turbine.UI.Color(1, 0.3, 0.5, 1.0)
+    );
+end
 
-    local power = self.player:GetPower();
-    local maxPower = self.player:GetMaxPower();
+function HealthBarWindow:UpdateBar(segments, current, max, highColor, midColor, lowColor,
+                                    highThresh, midThresh, pctKey, tierKey, 
+                                    textLabel, shadowLabel, alertKey, alertText, alertColor)
+    if not segments then return; end
 
-    if maxPower == nil or maxPower == 0 then maxPower = 1; end
-    if power == nil then power = 0; end
+    if not max or max == 0 then max = 1; end
+    if not current then current = 0; end
 
-    local pct = power / maxPower;
-    if pct > 1 then pct = 1; end
-    if pct < 0 then pct = 0; end
-
-    -- Skip if nothing changed (within 0.1% tolerance)
+    local pct = math.min(math.max(current / max, 0), 1);
     local pctInt = math.floor(pct * 1000);
-    if self.lastPowerPct == pctInt then return; end
+    
+    -- Skip if nothing changed
+    if self[pctKey] == pctInt then return; end
 
-    local oldStartIdx = 0;
-    if self.lastPowerPct and self.lastPowerPct >= 0 then
-        local oldPct = self.lastPowerPct / 1000;
-        local oldVisible = math.floor(self.numSegments * oldPct);
-        oldStartIdx = self.numSegments - oldVisible + 1;
-    end
-    self.lastPowerPct = pctInt;
+    local oldStartIdx = self:CalculateOldStartIndex(self[pctKey]);
+    self[pctKey] = pctInt;
 
-    -- Turn yellow below 75%, red below 50%
-    local r, g, b;
-    local colorTier;
-    if pct >= 0.75 then
-        r = 0.2; g = 0.5; b = 0.9; colorTier = 3;
-    elseif pct >= 0.5 then
-        r = 1.0; g = 0.85; b = 0.1; colorTier = 2;
-    else
-        r = 0.9; g = 0.15; b = 0.1; colorTier = 1;
-    end
-    local color = Turbine.UI.Color(1, r, g, b);
-
-    -- Detect if color tier changed — if so, recolor ALL visible segments
-    local tierChanged = (self.lastPowerTier ~= nil and self.lastPowerTier ~= colorTier);
-    self.lastPowerTier = colorTier;
+    local color, colorTier = GetColorForPercentage(pct, highColor, midColor, lowColor, 
+                                                    highThresh, midThresh);
+    local tierChanged = (self[tierKey] ~= nil and self[tierKey] ~= colorTier);
+    self[tierKey] = colorTier;
 
     local visibleCount = math.floor(self.numSegments * pct);
     local startIdx = self.numSegments - visibleCount + 1;
 
-    -- Full recolor if tier changed, otherwise delta-only
-    local lo, hi;
-    if tierChanged or oldStartIdx == 0 then
-        lo = startIdx; hi = self.numSegments;
-    else
-        lo = math.min(startIdx, oldStartIdx);
-        hi = math.max(startIdx, oldStartIdx);
-    end
-
+    -- Update visible segments
+    local lo, hi = self:CalculateUpdateRange(startIdx, oldStartIdx, tierChanged);
     for i = lo, hi do
-        local seg = self.powerFillSegments[i];
+        local seg = segments[i];
         if seg then
             if i >= startIdx then
                 seg:SetVisible(true);
-                seg:SetBackColor(color);
+                if tierChanged or i >= oldStartIdx then
+                    seg:SetBackColor(color);
+                end
             else
                 seg:SetVisible(false);
             end
         end
     end
 
+    -- Update text
     local txt = tostring(math.floor(pct * 100)) .. "%";
-    if self.powerText then self.powerText:SetText(txt); end
-    if self.powerTextShadow then self.powerTextShadow:SetText(txt); end
+    if textLabel then textLabel:SetText(txt); end
+    if shadowLabel then shadowLabel:SetText(txt); end
 
-    -- Low power alert
-    if pct < 0.3 and not self.lowPowerAlerted then
-        self.lowPowerAlerted = true;
-        self:ShowAlert("LOW POWER!", Turbine.UI.Color(1, 0.3, 0.5, 1.0));
-    elseif pct >= 0.3 then
-        self.lowPowerAlerted = false;
+    -- Handle low resource alert
+    if pct < CONSTANTS.LOW_THRESHOLD and not self[alertKey] then
+        self[alertKey] = true;
+        self:ShowAlert(alertText, alertColor);
+    elseif pct >= CONSTANTS.LOW_THRESHOLD then
+        self[alertKey] = false;
+    end
+end
+
+function HealthBarWindow:CalculateOldStartIndex(lastPct)
+    if lastPct and lastPct >= 0 then
+        local oldPct = lastPct / 1000;
+        local oldVisible = math.floor(self.numSegments * oldPct);
+        return self.numSegments - oldVisible + 1;
+    end
+    return 0;
+end
+
+function HealthBarWindow:CalculateUpdateRange(startIdx, oldStartIdx, tierChanged)
+    if oldStartIdx == 0 or tierChanged then
+        -- First update or tier change: repaint all visible segments
+        return startIdx, self.numSegments;
+    else
+        -- Delta update - only update changed segments
+        return math.min(startIdx, oldStartIdx), math.max(startIdx, oldStartIdx);
     end
 end
 
@@ -926,107 +898,81 @@ end
 -- =========================================================================
 function HealthBarWindow:CreateAlertLabel()
     local w, h = self:GetSize();
+    local centerX = w / 2;
+    local bottomY = h - 35;
 
-    -- Shadow
-    self.alertShadow = Turbine.UI.Label();
-    self.alertShadow:SetParent(self);
-    self.alertShadow:SetSize(400, 30);
-    self.alertShadow:SetPosition((w / 2) - 200 + 2, h - 35 + 2);
-    self.alertShadow:SetFont(Turbine.UI.Lotro.Font.TrajanProBold24);
-    self.alertShadow:SetForeColor(Turbine.UI.Color(1, 0, 0, 0));
-    self.alertShadow:SetTextAlignment(Turbine.UI.ContentAlignment.MiddleCenter);
+    self.alertShadow = CreateLabel(self, centerX - 200 + 2, bottomY + 2, 
+        400, 30, Turbine.UI.Lotro.Font.TrajanProBold24, COLORS.BLACK, 
+        Turbine.UI.ContentAlignment.MiddleCenter);
     self.alertShadow:SetZOrder(150);
-    self.alertShadow:SetMouseVisible(false);
     self.alertShadow:SetVisible(false);
 
-    -- Main text
-    self.alertLabel = Turbine.UI.Label();
-    self.alertLabel:SetParent(self);
-    self.alertLabel:SetSize(400, 30);
-    self.alertLabel:SetPosition((w / 2) - 200, h - 35);
-    self.alertLabel:SetFont(Turbine.UI.Lotro.Font.TrajanProBold24);
-    self.alertLabel:SetForeColor(Turbine.UI.Color(1, 1, 0.2, 0.2));
-    self.alertLabel:SetTextAlignment(Turbine.UI.ContentAlignment.MiddleCenter);
+    self.alertLabel = CreateLabel(self, centerX - 200, bottomY, 
+        400, 30, Turbine.UI.Lotro.Font.TrajanProBold24, 
+        Turbine.UI.Color(1, 1, 0.2, 0.2), 
+        Turbine.UI.ContentAlignment.MiddleCenter);
     self.alertLabel:SetZOrder(151);
-    self.alertLabel:SetMouseVisible(false);
     self.alertLabel:SetVisible(false);
 end
 
 function HealthBarWindow:ShowAlert(text, color)
-    -- Add to queue; alerts display one at a time
     table.insert(self.alertQueue, { text = text, color = color });
 end
 
 function HealthBarWindow:ProcessAlerts()
-    -- If currently showing, count down the timer
     if self.alertShowing then
-        self.alertTimer = self.alertTimer - 1;
-        -- Fade out in last 15 ticks
-        if self.alertTimer <= 15 and self.alertTimer > 0 then
-            local alpha = self.alertTimer / 15;
-            if self.alertLabel then self.alertLabel:SetOpacity(alpha); end
-            if self.alertShadow then self.alertShadow:SetOpacity(alpha); end
-        elseif self.alertTimer <= 0 then
-            self.alertShowing = false;
-            if self.alertLabel then self.alertLabel:SetVisible(false); end
-            if self.alertShadow then self.alertShadow:SetVisible(false); end
-        end
+        self:UpdateAlertAnimation();
         return;
     end
 
-    -- If queue has items, show the next one
     if #self.alertQueue > 0 then
-        local alert = table.remove(self.alertQueue, 1);
-        self.alertShowing = true;
-        self.alertTimer = 60; -- ~2 seconds at 30fps
+        self:DisplayNextAlert();
+    end
+end
 
-        if self.alertLabel then
-            self.alertLabel:SetText(alert.text);
-            if alert.color then
-                self.alertLabel:SetForeColor(alert.color);
-            end
-            self.alertLabel:SetOpacity(1);
-            self.alertLabel:SetVisible(true);
+function HealthBarWindow:UpdateAlertAnimation()
+    self.alertTimer = self.alertTimer - 1;
+    
+    if self.alertTimer <= CONSTANTS.ALERT_FADE_TICKS and self.alertTimer > 0 then
+        local alpha = self.alertTimer / CONSTANTS.ALERT_FADE_TICKS;
+        if self.alertLabel then self.alertLabel:SetOpacity(alpha); end
+        if self.alertShadow then self.alertShadow:SetOpacity(alpha); end
+    elseif self.alertTimer <= 0 then
+        self.alertShowing = false;
+        if self.alertLabel then self.alertLabel:SetVisible(false); end
+        if self.alertShadow then self.alertShadow:SetVisible(false); end
+    end
+end
+
+function HealthBarWindow:DisplayNextAlert()
+    local alert = table.remove(self.alertQueue, 1);
+    self.alertShowing = true;
+    self.alertTimer = CONSTANTS.ALERT_DURATION_TICKS;
+
+    if self.alertLabel then
+        self.alertLabel:SetText(alert.text);
+        if alert.color then
+            self.alertLabel:SetForeColor(alert.color);
         end
-        if self.alertShadow then
-            self.alertShadow:SetText(alert.text);
-            self.alertShadow:SetOpacity(1);
-            self.alertShadow:SetVisible(true);
-        end
+        self.alertLabel:SetOpacity(1);
+        self.alertLabel:SetVisible(true);
+    end
+    if self.alertShadow then
+        self.alertShadow:SetText(alert.text);
+        self.alertShadow:SetOpacity(1);
+        self.alertShadow:SetVisible(true);
     end
 end
 
 function HealthBarWindow:OnEffectAdded(args)
-    -- args is the Effect object in the Turbine API
     local effect = args;
-    if effect then
-        local name = "";
-        if effect.GetName then
-            name = effect:GetName();
-        end
-        if name and name ~= "" then
-            -- Check for common debuff/bleed keywords
-            local nameLower = string.lower(name);
-            local isDebuff = false;
-            local debuffKeywords = { "bleed", "wound", "poison", "disease", "fear", "dread",
-                "stun", "daze", "root", "slow", "debuff", "curse", "fire", "acid",
-                "shadow", "corruption", "dot", "drain" };
-            for _, kw in ipairs(debuffKeywords) do
-                if string.find(nameLower, kw) then
-                    isDebuff = true;
-                    break;
-                end
-            end
-
-            -- Also check if the effect is harmful via category if available
-            if not isDebuff and effect.IsDebuff then
-                isDebuff = effect:IsDebuff();
-            end
-
-            if isDebuff then
-                self:ShowAlert(name, Turbine.UI.Color(1, 1.0, 0.5, 0.1));
-            end
-        end
+    if not effect then return; end
+    
+    local name = SafeCall(function() return effect:GetName() end, "");
+    if name == "" then return; end
+    
+    if self:IsEffectHarmful(effect) then
+        self:ShowAlert(name, Turbine.UI.Color(1, 1.0, 0.5, 0.1));
     end
 end
 
@@ -1068,11 +1014,6 @@ end
 -- BUFF DISPLAY SYSTEM
 -- =========================================================================
 function HealthBarWindow:RefreshBuffList()
-    -- Configuration for Buff Layout
-    local BUFF_SIZE = 36;
-    local SPACING = 4;
-    local ROW_HEIGHT = BUFF_SIZE + 18; -- icon + timer text below
-    
     if not self.buffRows then self.buffRows = {}; end
     if not self.buffPanel then return; end
 
@@ -1085,128 +1026,142 @@ function HealthBarWindow:RefreshBuffList()
     local effects = self.player:GetEffects();
     if not effects then return; end
     
-    local count = effects:GetCount();
-    
-    -- First pass: Collect valid buffs (non-harmful, duration <= 12 hours)
-    local MAX_DURATION = 43200; -- 12 hours in seconds
-    local validEffects = {};
-    for i = 1, count do
-        local effect = effects:Get(i);
-        if not self:IsEffectHarmful(effect) then
-            -- Filter: only show short-duration buffs (12h or less)
-            local dominated = false;
-            local ok, dur = pcall(function() return effect:GetDuration() end);
-            if ok and dur then
-                -- dur <= 0 means permanent/toggle, dur > MAX_DURATION means very long buff
-                if dur <= 0 or dur > MAX_DURATION then
-                    dominated = true;
-                end
-            end
-            if not dominated then
-                table.insert(validEffects, effect);
-            end
-        end
-    end
-
+    -- Collect valid buffs
+    local validEffects = self:CollectValidEffects(effects);
     local numBuffs = #validEffects;
     
-    -- If count changed, trigger a rebuild so the window resizes
+    -- Trigger rebuild if buff count changed
     if self.lastBuffCount ~= numBuffs then
         self.lastBuffCount = numBuffs;
-        -- Only flag rebuild if we're not already inside one
         if not self.rebuilding then
             self.rebuildNeeded = true;
         end
     end
 
-    -- Calculate how many icons fit per row
+    -- Calculate layout
     local panelW = self.buffPanel:GetWidth();
-    local iconsPerRow = math.floor((panelW + SPACING) / (BUFF_SIZE + SPACING));
+    local iconsPerRow = math.floor((panelW + CONSTANTS.BUFF_SPACING) / 
+                                   (CONSTANTS.BUFF_ICON_SIZE + CONSTANTS.BUFF_SPACING));
     if iconsPerRow < 1 then iconsPerRow = 1; end
 
+    -- Display buffs
     for i, effect in ipairs(validEffects) do
-        local item = self.buffRows[i];
-        if not item then
-            item = self:CreateBuffIconItem();
-            table.insert(self.buffRows, item);
-        end
-        
-        -- Update Content
-        local success, err = pcall(function() item:SetEffect(effect); end);
-        if not success then
-             item.icon:SetVisible(false);
-        end
-
-        -- Calculate row and column
-        local col = (i - 1) % iconsPerRow;
-        local row = math.floor((i - 1) / iconsPerRow);
-
-        -- Center each row: figure out how many icons are in this row
-        local rowStart = row * iconsPerRow + 1;
-        local rowEnd = math.min(rowStart + iconsPerRow - 1, numBuffs);
-        local iconsInRow = rowEnd - rowStart + 1;
-        local rowWidth = iconsInRow * BUFF_SIZE + (iconsInRow - 1) * SPACING;
-        local rowOffsetX = (panelW - rowWidth) / 2;
-        if rowOffsetX < 0 then rowOffsetX = 0; end
-
-        local xPos = rowOffsetX + col * (BUFF_SIZE + SPACING);
-        local yPos = row * (ROW_HEIGHT + SPACING);
-        item:SetPosition(xPos, yPos);
-        item:SetVisible(true);
-        
-        table.insert(self.activeBuffs, item);
+        self:DisplayBuffIcon(i, effect, iconsPerRow, numBuffs, panelW);
     end
 end
 
+function HealthBarWindow:CollectValidEffects(effects)
+    local validEffects = {};
+    local count = effects:GetCount();
+    
+    for i = 1, count do
+        local effect = effects:Get(i);
+        if not self:IsEffectHarmful(effect) and self:ShouldDisplayEffect(effect) then
+            table.insert(validEffects, effect);
+        end
+    end
+    
+    return validEffects;
+end
+
+function HealthBarWindow:ShouldDisplayEffect(effect)
+    local duration = SafeCall(function() return effect:GetDuration() end, 0);
+    
+    -- Filter out permanent buffs and very long duration buffs (> 12 hours)
+    if duration <= 0 or duration > CONSTANTS.MAX_BUFF_DURATION then
+        return false;
+    end
+    
+    return true;
+end
+
+function HealthBarWindow:DisplayBuffIcon(index, effect, iconsPerRow, totalBuffs, panelWidth)
+    local item = self.buffRows[index];
+    if not item then
+        item = self:CreateBuffIconItem();
+        table.insert(self.buffRows, item);
+    end
+    
+    -- Update content
+    local success = pcall(function() item:SetEffect(effect); end);
+    if not success then
+        item.icon:SetVisible(false);
+    end
+
+    -- Calculate position with row centering
+    local col = (index - 1) % iconsPerRow;
+    local row = math.floor((index - 1) / iconsPerRow);
+    
+    local rowStart = row * iconsPerRow + 1;
+    local rowEnd = math.min(rowStart + iconsPerRow - 1, totalBuffs);
+    local iconsInRow = rowEnd - rowStart + 1;
+    local rowWidth = iconsInRow * CONSTANTS.BUFF_ICON_SIZE + 
+                    (iconsInRow - 1) * CONSTANTS.BUFF_SPACING;
+    local rowOffsetX = math.max((panelWidth - rowWidth) / 2, 0);
+
+    local xPos = rowOffsetX + col * (CONSTANTS.BUFF_ICON_SIZE + CONSTANTS.BUFF_SPACING);
+    local yPos = row * (CONSTANTS.BUFF_ROW_HEIGHT + CONSTANTS.BUFF_SPACING);
+    
+    item:SetPosition(xPos, yPos);
+    item:SetVisible(true);
+    
+    table.insert(self.activeBuffs, item);
+end
+
 function HealthBarWindow:CreateBuffIconItem()
-    local size = 36;
+    local size = CONSTANTS.BUFF_ICON_SIZE;
     local item = Turbine.UI.Control();
     item:SetParent(self.buffPanel);
-    item:SetSize(size, size + 16); -- Extra height for timer text below/overlay
-    item:SetMouseVisible(true); -- Enable mouse for tooltip
+    item:SetSize(size, size + 16);
+    item:SetMouseVisible(true);
     
-    -- Tooltip window (shown on hover) — large enough for full effect descriptions
+    -- Tooltip window — auto-sizing based on content
     local TT_WIDTH = 300;
-    item.tooltip = Turbine.UI.Window();
-    item.tooltip:SetSize(TT_WIDTH, 200);
-    item.tooltip:SetBackColor(Turbine.UI.Color(0.92, 0.05, 0.05, 0.12));
-    item.tooltip:SetVisible(false);
-    item.tooltip:SetZOrder(500);
-    item.tooltip:SetMouseVisible(false);
-    item.tooltip:SetOpacity(1);
+    item.tooltip = CreateTooltipWindow(TT_WIDTH, 200);
     
-    -- Name line (gold, bold)
-    item.tooltipName = Turbine.UI.Label();
-    item.tooltipName:SetParent(item.tooltip);
-    item.tooltipName:SetSize(TT_WIDTH - 8, 22);
-    item.tooltipName:SetPosition(4, 4);
-    item.tooltipName:SetFont(Turbine.UI.Lotro.Font.Verdana16);
-    item.tooltipName:SetForeColor(Turbine.UI.Color(1, 1.0, 0.85, 0.4));
-    item.tooltipName:SetTextAlignment(Turbine.UI.ContentAlignment.TopLeft);
-    item.tooltipName:SetMouseVisible(false);
+    -- Tooltip title
+    item.tooltipName = CreateLabel(
+        item.tooltip, 4, 4, TT_WIDTH - 8, 22,
+        Turbine.UI.Lotro.Font.Verdana16,
+        Turbine.UI.Color(1, 1.0, 0.85, 0.4),
+        Turbine.UI.ContentAlignment.TopLeft
+    );
     
-    -- Description / stats area (large, multi-line)
-    item.tooltipDesc = Turbine.UI.Label();
-    item.tooltipDesc:SetParent(item.tooltip);
-    item.tooltipDesc:SetSize(TT_WIDTH - 8, 170);
-    item.tooltipDesc:SetPosition(4, 28);
-    item.tooltipDesc:SetFont(Turbine.UI.Lotro.Font.Verdana14);
-    item.tooltipDesc:SetForeColor(Turbine.UI.Color(1, 0.9, 0.9, 0.9));
-    item.tooltipDesc:SetTextAlignment(Turbine.UI.ContentAlignment.TopLeft);
-    item.tooltipDesc:SetMouseVisible(false);
+    -- Tooltip description
+    item.tooltipDesc = CreateLabel(
+        item.tooltip, 4, 28, TT_WIDTH - 8, 170,
+        Turbine.UI.Lotro.Font.Verdana14,
+        COLORS.TOOLTIP_TEXT,
+        Turbine.UI.ContentAlignment.TopLeft
+    );
+    
+    -- Icon
+    item.icon = Turbine.UI.Control();
+    item.icon:SetParent(item);
+    item.icon:SetSize(size, size);
+    item.icon:SetPosition(0, 0);
+    item.icon:SetBlendMode(Turbine.UI.BlendMode.AlphaBlend);
+    item.icon:SetMouseVisible(false);
+    
+    -- Timer label
+    item.timerLabel = CreateLabel(
+        item, -5, size - 4, size + 10, 16,
+        Turbine.UI.Lotro.Font.Verdana12,
+        COLORS.TEXT_WHITE,
+        Turbine.UI.ContentAlignment.TopCenter
+    );
+    item.timerLabel:SetOutlineColor(COLORS.BLACK);
+    item.timerLabel:SetFontStyle(Turbine.UI.FontStyle.Outline);
     
     -- Hover events
+    local win = self;
     item.MouseEnter = function(sender, args)
         if sender.effectName and sender.effectName ~= "" then
             sender.tooltipName:SetText(sender.effectName);
             
-            -- Build full tooltip body with description + extra info
-            local body = "";
-            if sender.effectDesc and sender.effectDesc ~= "" then
-                body = sender.effectDesc;
-            end
+            -- Build tooltip body with description + duration
+            local body = sender.effectDesc or "";
             
-            -- Append duration info
             if sender.effectDuration and sender.effectDuration > 0 then
                 local dur = sender.effectDuration;
                 local durStr;
@@ -1223,68 +1178,38 @@ function HealthBarWindow:CreateBuffIconItem()
             
             sender.tooltipDesc:SetText(body);
             
-            -- Estimate tooltip height based on content
-            local lines = 2; -- name + padding
+            -- Auto-size tooltip based on content
+            local lines = 2;
             for _ in string.gmatch(body, "\n") do lines = lines + 1; end
-            -- Rough estimate: ~16px per line of description
             local descLines = math.max(lines, math.ceil(string.len(body) / 38));
             local ttHeight = 32 + descLines * 16;
-            if ttHeight < 60 then ttHeight = 60; end
-            if ttHeight > 300 then ttHeight = 300; end
+            ttHeight = math.max(60, math.min(ttHeight, 300));
+            
             sender.tooltip:SetSize(TT_WIDTH, ttHeight);
             sender.tooltipDesc:SetSize(TT_WIDTH - 8, ttHeight - 32);
             
-            -- Position tooltip above the icon
+            -- Position tooltip above icon
             local ix, iy = sender:GetPosition();
-            local px, py = self.buffPanel:GetPosition();
-            local wx, wy = self:GetPosition();
+            local px, py = win.buffPanel:GetPosition();
+            local wx, wy = win:GetPosition();
             sender.tooltip:SetPosition(wx + px + ix - (TT_WIDTH/2) + (size/2), wy + py + iy - ttHeight - 4);
             sender.tooltip:SetVisible(true);
         end
     end;
+    
     item.MouseLeave = function(sender, args)
         sender.tooltip:SetVisible(false);
     end;
     
-    -- Icon
-    item.icon = Turbine.UI.Control();
-    item.icon:SetParent(item);
-    item.icon:SetSize(size, size);
-    item.icon:SetPosition(0, 0);
-    item.icon:SetBlendMode(Turbine.UI.BlendMode.AlphaBlend);
-    item.icon:SetMouseVisible(false);
-    
-    -- Timer Overlay
-    item.timerLabel = Turbine.UI.Label();
-    item.timerLabel:SetParent(item);
-    item.timerLabel:SetSize(size + 10, 16);
-    item.timerLabel:SetPosition(-5, size - 4); -- Just below/overlapping bottom
-    item.timerLabel:SetFont(Turbine.UI.Lotro.Font.Verdana12);
-    item.timerLabel:SetForeColor(Turbine.UI.Color(1, 1.0, 1.0, 1.0));
-    item.timerLabel:SetTextAlignment(Turbine.UI.ContentAlignment.TopCenter);
-    item.timerLabel:SetOutlineColor(Turbine.UI.Color(1, 0, 0, 0)); -- Shadow effect
-    item.timerLabel:SetFontStyle(Turbine.UI.FontStyle.Outline);
-    item.timerLabel:SetMouseVisible(false);
-    
-    -- Method to set data — extract all available effect info
+    -- Method to set effect data
     item.SetEffect = function(sender, effect)
         sender.effect = effect;
+        sender.effectName = SafeCall(function() return effect:GetName() end, "");
+        sender.effectDesc = SafeCall(function() return effect:GetDescription() end, "");
+        sender.effectDuration = SafeCall(function() return effect:GetDuration() end, 0);
         
-        -- Store name
-        local nameOk, eName = pcall(function() return effect:GetName() end);
-        sender.effectName = (nameOk and eName) or "";
-        
-        -- Store description (this is where stat info lives in the Turbine API)
-        local descOk, eDesc = pcall(function() return effect:GetDescription() end);
-        sender.effectDesc = (descOk and eDesc) or "";
-        
-        -- Store duration for tooltip
-        local durOk, eDur = pcall(function() return effect:GetDuration() end);
-        sender.effectDuration = (durOk and eDur) or 0;
-        
-        -- Try to get icon
-        local status, iconID = pcall(function() return effect:GetIcon() end);
-        if status and iconID and type(iconID) == "number" then
+        local iconID = SafeCall(function() return effect:GetIcon() end, nil);
+        if iconID and type(iconID) == "number" then
             sender.icon:SetBackground(iconID);
             sender.icon:SetVisible(true);
         else
@@ -1304,23 +1229,12 @@ function HealthBarWindow:UpdateBuffTimers()
             local duration = row.effect:GetDuration();
             local startTime = row.effect:GetStartTime();
             
-            -- If duration is 0 or very large, it's permanent/toggle
             if duration > 86400 or duration <= 0 then
                 row.timerLabel:SetText("");
             else
                 local remaining = duration - (currentTime - startTime);
                 if remaining < 0 then remaining = 0; end
-                
-                -- Format time
-                local mins = math.floor(remaining / 60);
-                local secs = math.floor(remaining % 60);
-                if mins > 60 then
-                     row.timerLabel:SetText(string.format("%dh", math.floor(mins/60)));
-                elseif mins > 0 then
-                     row.timerLabel:SetText(string.format("%d:%02d", mins, secs));
-                else
-                     row.timerLabel:SetText(string.format("%ds", secs));
-                end
+                row.timerLabel:SetText(FormatTime(remaining));
             end
         end
     end
@@ -1329,22 +1243,21 @@ end
 function HealthBarWindow:IsEffectHarmful(effect)
     if not effect then return false; end
     
-    -- Check API flag first
-    if effect.IsDebuff and effect:IsDebuff() then return true; end
+    -- Check API flag
+    if SafeCall(function() return effect:IsDebuff() end, false) then 
+        return true; 
+    end
     
     -- Check keywords in name
-    local name = effect:GetName();
-    if not name then return false; end
+    local name = SafeCall(function() return effect:GetName() end, "");
+    if name == "" then return false; end
     
     local nameLower = string.lower(name);
-    local debuffKeywords = { "bleed", "wound", "poison", "disease", "fear", "dread",
-        "stun", "daze", "root", "slow", "debuff", "curse", "fire", "acid",
-        "shadow", "corruption", "dot", "drain" };
-        
-    for _, kw in ipairs(debuffKeywords) do
+    for _, kw in ipairs(DEBUFF_KEYWORDS) do
         if string.find(nameLower, kw) then
             return true;
         end
     end
+    
     return false;
 end
