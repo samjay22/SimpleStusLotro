@@ -17,7 +17,8 @@ CONSTANTS = {
     MAX_BUFF_DURATION = 43200, -- 12 hours in seconds
     
     -- Update Timings
-    REBUILD_COOLDOWN_TICKS = 2,
+    REBUILD_COOLDOWN_TICKS = 5,
+    BUFF_TIMER_INTERVAL = 15,
     
     -- Alert System
     ALERT_DURATION_TICKS = 60,
@@ -200,7 +201,7 @@ function HealthBarWindow:Constructor()
 end
 
 function HealthBarWindow:InitializeDefaultSettings()
-    self.numSegments = 100;
+    self.numSegments = 70;
     self.curveDepth = 50;
     self.barHeightTotal = 250;
     self.centerGap = 300;
@@ -215,6 +216,7 @@ function HealthBarWindow:InitializeCombatTracking()
         and (self.combatOpacity / 100) 
         or (self.oocOpacity / 100);
     self:SetOpacity(self.targetOpacity);
+    self.opacityDirty = false;
 end
 
 function HealthBarWindow:CreateBuffPanel()
@@ -241,6 +243,7 @@ function HealthBarWindow:SetupEventListeners()
         win.targetOpacity = win.inCombat 
             and (win.combatOpacity / 100) 
             or (win.oocOpacity / 100);
+        win.opacityDirty = true;
     end;
     
     self.PositionChanged = function()
@@ -282,7 +285,8 @@ function HealthBarWindow:SetupUpdateTimer()
     self.lowHealthAlerted = false;
     self.lowPowerAlerted = false;
     
-    self.startupTicks = 10;
+    self.startupTicks = 4;
+    self.buffTimerTicks = 0;
     
     self.updateTimer = Turbine.UI.Control();
     self.updateTimer:SetWantsUpdates(true);
@@ -328,18 +332,25 @@ function HealthBarWindow:ProcessUpdateTick(sender)
         self:UpdatePower();
     end
 
-    -- Smooth opacity transitions every tick
-    local curOp = self:GetOpacity();
-    if math.abs(curOp - self.targetOpacity) > 0.01 then
-        if curOp < self.targetOpacity then
+    -- Smooth opacity transitions (skip when already at target)
+    if self.opacityDirty ~= false then
+        local curOp = self:GetOpacity();
+        local diff = curOp - self.targetOpacity;
+        if diff > 0.01 then
+            self:SetOpacity(math.max(curOp - 0.02, self.targetOpacity));
+        elseif diff < -0.01 then
             self:SetOpacity(math.min(curOp + 0.05, self.targetOpacity));
         else
-            self:SetOpacity(math.max(curOp - 0.02, self.targetOpacity));
+            self.opacityDirty = false;
         end
     end
 
-    -- Update buff timers every tick
-    self:UpdateBuffTimers();
+    -- Throttled buff timer updates (every BUFF_TIMER_INTERVAL ticks)
+    self.buffTimerTicks = (self.buffTimerTicks or 0) + 1;
+    if self.buffTimerTicks >= CONSTANTS.BUFF_TIMER_INTERVAL then
+        self.buffTimerTicks = 0;
+        self:UpdateBuffTimers();
+    end
 
     -- Alert processing every tick
     if self.alertShowing or #self.alertQueue > 0 then
@@ -718,7 +729,7 @@ function HealthBarWindow:CreateSettingsPanel()
     end
 
     -- Segments slider
-    self.segSlider = CreateSliderRow(self.settingsPanel, yOff, "Segments:", 30, 1000, self.numSegments, function(val)
+    self.segSlider = CreateSliderRow(self.settingsPanel, yOff, "Segments:", 30, 200, self.numSegments, function(val)
         self.numSegments = val;
     end);
 
@@ -746,6 +757,7 @@ function HealthBarWindow:CreateSettingsPanel()
     self.combatOpSlider = CreateSliderRow(self.settingsPanel, yOff + rowH * 5, "Combat %:", 5, 100, self.combatOpacity, function(val)
         self.combatOpacity = val;
         self.targetOpacity = self.inCombat and (self.combatOpacity / 100) or (self.oocOpacity / 100);
+        win.opacityDirty = true;
         win.rebuildNeeded = false;
     end);
 
@@ -753,6 +765,7 @@ function HealthBarWindow:CreateSettingsPanel()
     self.oocOpSlider = CreateSliderRow(self.settingsPanel, yOff + rowH * 6, "Idle %:", 1, 100, self.oocOpacity, function(val)
         self.oocOpacity = val;
         self.targetOpacity = self.inCombat and (self.combatOpacity / 100) or (self.oocOpacity / 100);
+        win.opacityDirty = true;
         win.rebuildNeeded = false;
     end);
 
@@ -1000,7 +1013,7 @@ end
 function HealthBarWindow:LoadSettings()
     local settings = Turbine.PluginData.Load(Turbine.DataScope.Character, "EasyHealthBarSettings");
     if settings then
-        self.numSegments = settings.numSegments or self.numSegments;
+        self.numSegments = math.min(settings.numSegments or self.numSegments, 200);
         self.curveDepth = settings.curveDepth or self.curveDepth;
         self.barHeightTotal = settings.barHeightTotal or self.barHeightTotal;
         self.centerGap = settings.centerGap or self.centerGap;
@@ -1228,13 +1241,20 @@ function HealthBarWindow:UpdateBuffTimers()
         if row.effect then
             local duration = row.effect:GetDuration();
             local startTime = row.effect:GetStartTime();
+            local newText;
             
             if duration > 86400 or duration <= 0 then
-                row.timerLabel:SetText("");
+                newText = "";
             else
                 local remaining = duration - (currentTime - startTime);
                 if remaining < 0 then remaining = 0; end
-                row.timerLabel:SetText(FormatTime(remaining));
+                newText = FormatTime(remaining);
+            end
+            
+            -- Only call SetText when the display text actually changes
+            if row.lastTimerText ~= newText then
+                row.lastTimerText = newText;
+                row.timerLabel:SetText(newText);
             end
         end
     end
