@@ -311,7 +311,18 @@ function HealthBarWindow:ProcessUpdateTick(sender)
         end
     end
 
-    -- Handle rebuild throttling
+    -- Process dirty flags FIRST (coalesces rapid events into one update per tick)
+    -- Health/power updates are lightweight and must not be delayed by rebuilds
+    if self.healthDirty then
+        self.healthDirty = false;
+        self:UpdateHealth();
+    end
+    if self.powerDirty then
+        self.powerDirty = false;
+        self:UpdatePower();
+    end
+
+    -- Handle rebuild throttling (heavier operation, runs after health/power)
     if self.rebuildNeeded then
         if not self.rebuildCooldown or self.rebuildCooldown <= 0 then
             self.rebuildNeeded = false;
@@ -320,16 +331,6 @@ function HealthBarWindow:ProcessUpdateTick(sender)
         else
             self.rebuildCooldown = self.rebuildCooldown - 1;
         end
-    end
-
-    -- Process dirty flags (coalesces rapid events into one update per tick)
-    if self.healthDirty then
-        self.healthDirty = false;
-        self:UpdateHealth();
-    end
-    if self.powerDirty then
-        self.powerDirty = false;
-        self:UpdatePower();
     end
 
     -- Smooth opacity transitions (skip when already at target)
@@ -565,9 +566,10 @@ function HealthBarWindow:UpdateVerticalCurve(pool, xBase, color, isFill, directi
         end
     end
 
-    -- Hide any excess segments from a previous higher count
-    for i = n + 1, #pool do
-        pool[i]:SetVisible(false);
+    -- Destroy excess segments from a previous higher count
+    for i = #pool, n + 1, -1 do
+        pool[i]:SetParent(nil);
+        pool[i] = nil;
     end
 
     return pool;
