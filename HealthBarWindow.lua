@@ -10,7 +10,7 @@ import "Turbine.UI.Lotro";
 -- CONSTANTS (File-scope, accessible to all functions)
 -- =========================================================================
 CONSTANTS = {
-    -- Buff Display
+    -- Buff/Debuff Display
     BUFF_ICON_SIZE = 36,
     BUFF_SPACING = 4,
     BUFF_ROW_HEIGHT = 36 + 18,
@@ -23,7 +23,7 @@ CONSTANTS = {
     -- Alert System
     ALERT_DURATION_TICKS = 60,
     ALERT_FADE_TICKS = 15,
-    LOW_THRESHOLD = 0.3,
+    LOW_THRESHOLD = 0.5,
     
     -- UI Sizing
     LABEL_WIDTH = 200,
@@ -55,6 +55,8 @@ COLORS = {
     POWER_LOW = Turbine.UI.Color(1, 0.9, 0.15, 0.1),
     POWER_BG = Turbine.UI.Color(0.2, 0.2, 0.2, 0.4),
     
+    DEBUFF_BG = Turbine.UI.Color(0.3, 0.5, 0.1, 0.1),
+    
     TOOLTIP_BG = Turbine.UI.Color(0.92, 0.05, 0.05, 0.12),
     TOOLTIP_TITLE = Turbine.UI.Color(1, 1.0, 0.85, 0.4),
     TOOLTIP_TEXT = Turbine.UI.Color(1, 0.9, 0.9, 0.9),
@@ -63,6 +65,7 @@ COLORS = {
     TEXT_POWER = Turbine.UI.Color(1, 0.2, 0.6, 1.0),
     TEXT_WHITE = Turbine.UI.Color(1, 1, 1, 1),
     TEXT_GRAY = Turbine.UI.Color(0.8, 0.8, 0.8, 0.8),
+    TEXT_RED = Turbine.UI.Color(1, 1.0, 0.3, 0.3),
 };
 
 -- Debuff Keywords
@@ -179,6 +182,7 @@ function HealthBarWindow:Constructor()
 
     -- Create UI components
     self:CreateBuffPanel();
+    self:CreateDebuffPanel();
     self:RebuildBars();
     self.firstBuild = false;
     
@@ -198,6 +202,7 @@ function HealthBarWindow:Constructor()
     self:UpdateHealth();
     self:UpdatePower();
     self:RefreshBuffList();
+    self:RefreshDebuffList();
 end
 
 function HealthBarWindow:InitializeDefaultSettings()
@@ -228,6 +233,15 @@ function HealthBarWindow:CreateBuffPanel()
     self.buffPanel:SetZOrder(50);
 end
 
+function HealthBarWindow:CreateDebuffPanel()
+    self.debuffRows = {};
+    self.activeDebuffs = {};
+    self.debuffPanel = Turbine.UI.Control();
+    self.debuffPanel:SetParent(self);
+    self.debuffPanel:SetMouseVisible(false);
+    self.debuffPanel:SetZOrder(50);
+end
+
 function HealthBarWindow:SetupEventListeners()
     local win = self;
     
@@ -252,15 +266,17 @@ function HealthBarWindow:SetupEventListeners()
         end
     end;
     
-    -- Buff events update directly
+    -- Buff/debuff events
     local effects = self.player:GetEffects();
     if effects then
         effects.EffectAdded = function(sender, args)
             win:OnEffectAdded(args);
             win:RefreshBuffList();
+            win:RefreshDebuffList();
         end;
         effects.EffectRemoved = function()
             win:RefreshBuffList();
+            win:RefreshDebuffList();
         end;
     end
 end
@@ -312,7 +328,6 @@ function HealthBarWindow:ProcessUpdateTick(sender)
     end
 
     -- Process dirty flags FIRST (coalesces rapid events into one update per tick)
-    -- Health/power updates are lightweight and must not be delayed by rebuilds
     if self.healthDirty then
         self.healthDirty = false;
         self:UpdateHealth();
@@ -346,21 +361,18 @@ function HealthBarWindow:ProcessUpdateTick(sender)
         end
     end
 
-    -- Throttled buff timer updates (every BUFF_TIMER_INTERVAL ticks)
+    -- Throttled buff/debuff timer updates (every BUFF_TIMER_INTERVAL ticks)
     self.buffTimerTicks = (self.buffTimerTicks or 0) + 1;
     if self.buffTimerTicks >= CONSTANTS.BUFF_TIMER_INTERVAL then
         self.buffTimerTicks = 0;
         self:UpdateBuffTimers();
+        self:UpdateDebuffTimers();
     end
 
     -- Alert processing every tick
     if self.alertShowing or #self.alertQueue > 0 then
         self:ProcessAlerts();
     end
-end
-
-function HealthBarWindow:UpdateOpacityTransition()
-    -- This method is no longer needed, handled inline in ProcessUpdateTick
 end
 
 -- =========================================================================
@@ -374,7 +386,12 @@ function HealthBarWindow:RebuildBars()
     self:SetBackColor(COLORS.TRANSPARENT);
     self:SetText("");
 
-    -- Configure buff panel
+    -- Store layout offsets for use by UpdateVerticalCurve
+    self.debuffAreaHeight = dimensions.debuffHeight;
+    self.barAreaHeight = dimensions.barAreaHeight;
+
+    -- Position debuff panel at top, buff panel at bottom
+    self:PositionDebuffPanel(dimensions);
     self:PositionBuffPanel(dimensions);
 
     -- Load position on first build
@@ -388,7 +405,7 @@ function HealthBarWindow:RebuildBars()
     local rightBase = centerX + (self.centerGap / 2);
 
     self:RebuildBarSegments(leftBase, rightBase);
-    self:RebuildTextLabels(leftBase, rightBase, dimensions.barAreaHeight);
+    self:RebuildTextLabels(leftBase, rightBase, dimensions);
     self:RepositionUIElements(dimensions);
 
     -- Force full update
@@ -397,6 +414,7 @@ function HealthBarWindow:RebuildBars()
     self:UpdateHealth();
     self:UpdatePower();
     self:RefreshBuffList();
+    self:RefreshDebuffList();
 
     self.rebuilding = false;
 end
@@ -405,34 +423,52 @@ function HealthBarWindow:CalculateDimensions()
     local totalWidth = self.centerGap + (self.curveDepth * 2) + 400;
     local barAreaHeight = self.barHeightTotal + 60;
 
-    -- Calculate buff area dimensions
+    -- Calculate icons per row (shared by buff and debuff)
     local iconsPerRow = math.floor((totalWidth + CONSTANTS.BUFF_SPACING) / 
                                    (CONSTANTS.BUFF_ICON_SIZE + CONSTANTS.BUFF_SPACING));
     if iconsPerRow < 1 then iconsPerRow = 1; end
     self.buffIconsPerRow = iconsPerRow;
 
+    -- Buff area (bottom)
     local buffCount = self.lastBuffCount or 0;
-    local numRows = math.ceil(buffCount / iconsPerRow);
-    if numRows < 1 then numRows = 1; end
-    
-    local buffHeight = numRows * (CONSTANTS.BUFF_ROW_HEIGHT + CONSTANTS.BUFF_SPACING) + 4;
+    local buffNumRows = math.ceil(buffCount / iconsPerRow);
+    if buffNumRows < 1 then buffNumRows = 1; end
+    local buffHeight = buffNumRows * (CONSTANTS.BUFF_ROW_HEIGHT + CONSTANTS.BUFF_SPACING) + 4;
     if buffHeight < CONSTANTS.BUFF_ROW_HEIGHT + 8 then 
         buffHeight = CONSTANTS.BUFF_ROW_HEIGHT + 8; 
     end
 
+    -- Debuff area (top)
+    local debuffCount = self.lastDebuffCount or 0;
+    local debuffNumRows = math.ceil(debuffCount / iconsPerRow);
+    if debuffNumRows < 1 then debuffNumRows = 1; end
+    local debuffHeight = debuffNumRows * (CONSTANTS.BUFF_ROW_HEIGHT + CONSTANTS.BUFF_SPACING) + 4;
+    if debuffHeight < CONSTANTS.BUFF_ROW_HEIGHT + 8 then 
+        debuffHeight = CONSTANTS.BUFF_ROW_HEIGHT + 8; 
+    end
+
     return {
         totalWidth = totalWidth,
-        totalHeight = barAreaHeight + buffHeight,
+        totalHeight = debuffHeight + barAreaHeight + buffHeight,
         barAreaHeight = barAreaHeight,
         buffHeight = buffHeight,
+        debuffHeight = debuffHeight,
         iconsPerRow = iconsPerRow
     };
+end
+
+function HealthBarWindow:PositionDebuffPanel(dimensions)
+    if self.debuffPanel then
+        self.debuffPanel:SetSize(dimensions.totalWidth, dimensions.debuffHeight);
+        self.debuffPanel:SetPosition(0, 0);
+        self.debuffPanel:SetZOrder(50);
+    end
 end
 
 function HealthBarWindow:PositionBuffPanel(dimensions)
     if self.buffPanel then
         self.buffPanel:SetSize(dimensions.totalWidth, dimensions.buffHeight);
-        self.buffPanel:SetPosition(0, dimensions.barAreaHeight);
+        self.buffPanel:SetPosition(0, dimensions.debuffHeight + dimensions.barAreaHeight);
         self.buffPanel:SetZOrder(50);
     end
 end
@@ -463,9 +499,9 @@ function HealthBarWindow:RebuildBarSegments(leftBase, rightBase)
         self.powerFillSegments, rightBase, COLORS.POWER_HIGH, true, 1);
 end
 
-function HealthBarWindow:RebuildTextLabels(leftBase, rightBase, barAreaHeight)
+function HealthBarWindow:RebuildTextLabels(leftBase, rightBase, dimensions)
     local font = Turbine.UI.Lotro.Font.TrajanProBold24;
-    local labelY = (barAreaHeight / 2) - 15;
+    local labelY = dimensions.debuffHeight + (dimensions.barAreaHeight / 2) - 15;
 
     -- Health text (right-aligned, left side)
     local healthX = leftBase - CONSTANTS.LABEL_WIDTH - self.curveDepth - 10;
@@ -503,7 +539,7 @@ end
 
 function HealthBarWindow:RepositionUIElements(dimensions)
     local centerX = dimensions.totalWidth / 2;
-    local centerY = dimensions.barAreaHeight / 2;
+    local centerY = dimensions.debuffHeight + (dimensions.barAreaHeight / 2);
 
     -- Drag labels
     if self.dragLabel then
@@ -517,10 +553,10 @@ function HealthBarWindow:RepositionUIElements(dimensions)
 
     -- Alert labels
     if self.alertLabel then
-        self.alertLabel:SetPosition(centerX - 200, dimensions.barAreaHeight - 35);
+        self.alertLabel:SetPosition(centerX - 200, dimensions.debuffHeight + dimensions.barAreaHeight - 35);
     end
     if self.alertShadow then
-        self.alertShadow:SetPosition(centerX - 200 + 2, dimensions.barAreaHeight - 35 + 2);
+        self.alertShadow:SetPosition(centerX - 200 + 2, dimensions.debuffHeight + dimensions.barAreaHeight - 35 + 2);
     end
 
     -- Ensure unlocked state is correct
@@ -529,17 +565,20 @@ function HealthBarWindow:RepositionUIElements(dimensions)
     end
 end
 
--- Resize a segment pool: reuse existing controls, create new ones if needed, hide extras
+-- =========================================================================
+-- SEGMENT CURVE WITH ROTATION
+-- =========================================================================
 function HealthBarWindow:UpdateVerticalCurve(pool, xBase, color, isFill, direction)
     pool = pool or {};
     local segHeight = self.barHeightTotal / self.numSegments;
     local n = self.numSegments;
+    local yOffset = (self.debuffAreaHeight or 0) + 30;
 
     for i = 1, n do
         local t = (i - 1) / (n - 1);
         local yNorm = (t * 2) - 1;
         local xCurve = (yNorm * yNorm) * self.curveDepth;
-        local yPos = (i - 1) * segHeight + 30;
+        local yPos = (i - 1) * segHeight + yOffset;
 
         local xPos;
         if direction == -1 then
@@ -606,7 +645,7 @@ end
 function HealthBarWindow:CreateDragOverlay()
     local w, h = self:GetSize();
 
-    -- "Drag to Move" label (parented directly on window, no opaque overlay)
+    -- "Drag to Move" label
     self.dragLabel = Turbine.UI.Label();
     self.dragLabel:SetParent(self);
     self.dragLabel:SetSize(300, 30);
@@ -635,7 +674,6 @@ function HealthBarWindow:CreateDragOverlay()
     self.lockLabel:SetVisible(false);
 
     -- Dragging logic handled on the window itself
-    -- (all bar segments have SetMouseVisible(false), so clicks fall through to window)
     self.dragging = false;
     self.dragStartX = 0;
     self.dragStartY = 0;
@@ -670,7 +708,7 @@ end
 -- =========================================================================
 function HealthBarWindow:CreateSettingsPanel()
     local panelWidth = 260;
-    local panelHeight = 290;
+    local panelHeight = 320;
 
     self.settingsPanel = Turbine.UI.Lotro.Window();
     self.settingsPanel:SetSize(panelWidth, panelHeight);
@@ -723,39 +761,38 @@ function HealthBarWindow:CreateSettingsPanel()
             local val = sb:GetValue();
             valLabel:SetText(tostring(val));
             onChange(val);
-            -- Flag a live-preview rebuild on next update tick
             win.rebuildNeeded = true;
         end;
 
-        return sb;
+        return sb, valLabel;
     end
 
-    -- Segments slider
+    -- Row 0: Segments slider
     self.segSlider = CreateSliderRow(self.settingsPanel, yOff, "Segments:", 30, 200, self.numSegments, function(val)
         self.numSegments = val;
     end);
 
-    -- Curve Depth slider
+    -- Row 1: Curve Depth slider
     self.depthSlider = CreateSliderRow(self.settingsPanel, yOff + rowH, "Curve:", 10, 150, self.curveDepth, function(val)
         self.curveDepth = val;
     end);
 
-    -- Bar Height slider
+    -- Row 2: Bar Height slider
     self.heightSlider = CreateSliderRow(self.settingsPanel, yOff + rowH * 2, "Height:", 80, 500, self.barHeightTotal, function(val)
         self.barHeightTotal = val;
     end);
 
-    -- Center Gap slider
+    -- Row 3: Center Gap slider
     self.gapSlider = CreateSliderRow(self.settingsPanel, yOff + rowH * 3, "Gap:", 100, 600, self.centerGap, function(val)
         self.centerGap = val;
     end);
 
-    -- Thickness slider
+    -- Row 4: Thickness slider
     self.thickSlider = CreateSliderRow(self.settingsPanel, yOff + rowH * 4, "Thickness:", 3, 30, self.segThickness, function(val)
         self.segThickness = val;
     end);
 
-    -- Combat Opacity slider (percent) — no rebuild needed
+    -- Row 5: Combat Opacity slider — no rebuild needed
     self.combatOpSlider = CreateSliderRow(self.settingsPanel, yOff + rowH * 5, "Combat %:", 5, 100, self.combatOpacity, function(val)
         self.combatOpacity = val;
         self.targetOpacity = self.inCombat and (self.combatOpacity / 100) or (self.oocOpacity / 100);
@@ -763,7 +800,7 @@ function HealthBarWindow:CreateSettingsPanel()
         win.rebuildNeeded = false;
     end);
 
-    -- Out-of-Combat Opacity slider (percent) — no rebuild needed
+    -- Row 6: Out-of-Combat Opacity slider — no rebuild needed
     self.oocOpSlider = CreateSliderRow(self.settingsPanel, yOff + rowH * 6, "Idle %:", 1, 100, self.oocOpacity, function(val)
         self.oocOpacity = val;
         self.targetOpacity = self.inCombat and (self.combatOpacity / 100) or (self.oocOpacity / 100);
@@ -771,16 +808,80 @@ function HealthBarWindow:CreateSettingsPanel()
         win.rebuildNeeded = false;
     end);
 
-    -- Save button (persists to disk; live preview is automatic)
+    -- Button row
+    local btnY = yOff + rowH * 7 + 8;
+    local btnH = 25;
+
+    -- Save button
     local saveBtn = Turbine.UI.Lotro.Button();
     saveBtn:SetParent(self.settingsPanel);
-    saveBtn:SetPosition((panelWidth / 2) - 40, yOff + rowH * 7 + 5);
-    saveBtn:SetSize(80, 25);
+    saveBtn:SetPosition(10, btnY);
+    saveBtn:SetSize(70, btnH);
     saveBtn:SetText("Save");
-
     saveBtn.Click = function(sender, args)
         win:SaveSettings();
     end;
+
+    -- Center button — moves window to screen center
+    local centerBtn = Turbine.UI.Lotro.Button();
+    centerBtn:SetParent(self.settingsPanel);
+    centerBtn:SetPosition(90, btnY);
+    centerBtn:SetSize(75, btnH);
+    centerBtn:SetText("Center");
+    centerBtn.Click = function(sender, args)
+        win:CenterOnScreen();
+    end;
+
+    -- Reset Config button — restores all defaults
+    local resetBtn = Turbine.UI.Lotro.Button();
+    resetBtn:SetParent(self.settingsPanel);
+    resetBtn:SetPosition(175, btnY);
+    resetBtn:SetSize(75, btnH);
+    resetBtn:SetText("Reset");
+    resetBtn.Click = function(sender, args)
+        win:ResetConfiguration();
+    end;
+end
+
+-- =========================================================================
+-- CENTER & RESET
+-- =========================================================================
+function HealthBarWindow:CenterOnScreen()
+    local screenWidth = Turbine.UI.Display:GetWidth();
+    local screenHeight = Turbine.UI.Display:GetHeight();
+    local w, h = self:GetSize();
+    self:SetPosition(
+        math.floor((screenWidth - w) / 2),
+        math.floor((screenHeight - h) / 2)
+    );
+    self:SavePosition();
+end
+
+function HealthBarWindow:ResetConfiguration()
+    -- Restore all settings to defaults
+    self:InitializeDefaultSettings();
+    
+    -- Update slider positions to reflect defaults
+    if self.segSlider then self.segSlider:SetValue(self.numSegments); end
+    if self.depthSlider then self.depthSlider:SetValue(self.curveDepth); end
+    if self.heightSlider then self.heightSlider:SetValue(self.barHeightTotal); end
+    if self.gapSlider then self.gapSlider:SetValue(self.centerGap); end
+    if self.thickSlider then self.thickSlider:SetValue(self.segThickness); end
+    if self.combatOpSlider then self.combatOpSlider:SetValue(self.combatOpacity); end
+    if self.oocOpSlider then self.oocOpSlider:SetValue(self.oocOpacity); end
+
+    -- Update opacity target
+    self.targetOpacity = self.inCombat 
+        and (self.combatOpacity / 100) 
+        or (self.oocOpacity / 100);
+    self.opacityDirty = true;
+
+    -- Center on screen and rebuild
+    self:CenterOnScreen();
+    self.rebuildNeeded = true;
+
+    -- Save the reset state
+    self:SaveSettings();
 end
 
 -- =========================================================================
@@ -900,10 +1001,8 @@ end
 
 function HealthBarWindow:CalculateUpdateRange(startIdx, oldStartIdx, tierChanged)
     if oldStartIdx == 0 or tierChanged then
-        -- First update or tier change: repaint all visible segments
         return startIdx, self.numSegments;
     else
-        -- Delta update - only update changed segments
         return math.min(startIdx, oldStartIdx), math.max(startIdx, oldStartIdx);
     end
 end
@@ -1026,7 +1125,7 @@ function HealthBarWindow:LoadSettings()
 end
 
 -- =========================================================================
--- BUFF DISPLAY SYSTEM
+-- BUFF DISPLAY SYSTEM (bottom panel)
 -- =========================================================================
 function HealthBarWindow:RefreshBuffList()
     if not self.buffRows then self.buffRows = {}; end
@@ -1041,7 +1140,7 @@ function HealthBarWindow:RefreshBuffList()
     local effects = self.player:GetEffects();
     if not effects then return; end
     
-    -- Collect valid buffs
+    -- Collect valid buffs (non-harmful, with duration)
     local validEffects = self:CollectValidEffects(effects);
     local numBuffs = #validEffects;
     
@@ -1061,7 +1160,8 @@ function HealthBarWindow:RefreshBuffList()
 
     -- Display buffs
     for i, effect in ipairs(validEffects) do
-        self:DisplayBuffIcon(i, effect, iconsPerRow, numBuffs, panelW);
+        self:DisplayIconInPanel(i, effect, iconsPerRow, numBuffs, panelW,
+                                self.buffRows, self.activeBuffs, self.buffPanel, false);
     end
 end
 
@@ -1090,11 +1190,70 @@ function HealthBarWindow:ShouldDisplayEffect(effect)
     return true;
 end
 
-function HealthBarWindow:DisplayBuffIcon(index, effect, iconsPerRow, totalBuffs, panelWidth)
-    local item = self.buffRows[index];
+-- =========================================================================
+-- DEBUFF DISPLAY SYSTEM (top panel)
+-- =========================================================================
+function HealthBarWindow:RefreshDebuffList()
+    if not self.debuffRows then self.debuffRows = {}; end
+    if not self.debuffPanel then return; end
+
+    -- Hide all existing debuff items
+    for _, item in ipairs(self.debuffRows) do
+        item:SetVisible(false);
+    end
+    self.activeDebuffs = {};
+    
+    local effects = self.player:GetEffects();
+    if not effects then return; end
+    
+    -- Collect harmful effects with duration
+    local debuffEffects = self:CollectDebuffEffects(effects);
+    local numDebuffs = #debuffEffects;
+    
+    -- Trigger rebuild if debuff count changed
+    if self.lastDebuffCount ~= numDebuffs then
+        self.lastDebuffCount = numDebuffs;
+        if not self.rebuilding then
+            self.rebuildNeeded = true;
+        end
+    end
+
+    -- Calculate layout
+    local panelW = self.debuffPanel:GetWidth();
+    local iconsPerRow = math.floor((panelW + CONSTANTS.BUFF_SPACING) / 
+                                   (CONSTANTS.BUFF_ICON_SIZE + CONSTANTS.BUFF_SPACING));
+    if iconsPerRow < 1 then iconsPerRow = 1; end
+
+    -- Display debuffs
+    for i, effect in ipairs(debuffEffects) do
+        self:DisplayIconInPanel(i, effect, iconsPerRow, numDebuffs, panelW,
+                                self.debuffRows, self.activeDebuffs, self.debuffPanel, true);
+    end
+end
+
+function HealthBarWindow:CollectDebuffEffects(effects)
+    local debuffEffects = {};
+    local count = effects:GetCount();
+    
+    for i = 1, count do
+        local effect = effects:Get(i);
+        if self:IsEffectHarmful(effect) and self:ShouldDisplayEffect(effect) then
+            table.insert(debuffEffects, effect);
+        end
+    end
+    
+    return debuffEffects;
+end
+
+-- =========================================================================
+-- SHARED ICON DISPLAY (used by both buffs and debuffs)
+-- =========================================================================
+function HealthBarWindow:DisplayIconInPanel(index, effect, iconsPerRow, totalIcons, panelWidth,
+                                            rows, activeList, parentPanel, isDebuff)
+    local item = rows[index];
     if not item then
-        item = self:CreateBuffIconItem();
-        table.insert(self.buffRows, item);
+        item = self:CreateIconItem(parentPanel, isDebuff);
+        table.insert(rows, item);
     end
     
     -- Update content
@@ -1108,7 +1267,7 @@ function HealthBarWindow:DisplayBuffIcon(index, effect, iconsPerRow, totalBuffs,
     local row = math.floor((index - 1) / iconsPerRow);
     
     local rowStart = row * iconsPerRow + 1;
-    local rowEnd = math.min(rowStart + iconsPerRow - 1, totalBuffs);
+    local rowEnd = math.min(rowStart + iconsPerRow - 1, totalIcons);
     local iconsInRow = rowEnd - rowStart + 1;
     local rowWidth = iconsInRow * CONSTANTS.BUFF_ICON_SIZE + 
                     (iconsInRow - 1) * CONSTANTS.BUFF_SPACING;
@@ -1120,25 +1279,29 @@ function HealthBarWindow:DisplayBuffIcon(index, effect, iconsPerRow, totalBuffs,
     item:SetPosition(xPos, yPos);
     item:SetVisible(true);
     
-    table.insert(self.activeBuffs, item);
+    table.insert(activeList, item);
 end
 
-function HealthBarWindow:CreateBuffIconItem()
+function HealthBarWindow:CreateIconItem(parentPanel, isDebuff)
     local size = CONSTANTS.BUFF_ICON_SIZE;
     local item = Turbine.UI.Control();
-    item:SetParent(self.buffPanel);
+    item:SetParent(parentPanel);
     item:SetSize(size, size + 16);
     item:SetMouseVisible(true);
+    item.isDebuff = isDebuff;
     
-    -- Tooltip window — auto-sizing based on content
+    -- Tooltip window
     local TT_WIDTH = 300;
     item.tooltip = CreateTooltipWindow(TT_WIDTH, 200);
     
     -- Tooltip title
+    local titleColor = isDebuff 
+        and Turbine.UI.Color(1, 1.0, 0.4, 0.4) 
+        or Turbine.UI.Color(1, 1.0, 0.85, 0.4);
     item.tooltipName = CreateLabel(
         item.tooltip, 4, 4, TT_WIDTH - 8, 22,
         Turbine.UI.Lotro.Font.Verdana16,
-        Turbine.UI.Color(1, 1.0, 0.85, 0.4),
+        titleColor,
         Turbine.UI.ContentAlignment.TopLeft
     );
     
@@ -1158,11 +1321,23 @@ function HealthBarWindow:CreateBuffIconItem()
     item.icon:SetBlendMode(Turbine.UI.BlendMode.AlphaBlend);
     item.icon:SetMouseVisible(false);
     
+    -- Red tint border for debuffs
+    if isDebuff then
+        item.border = Turbine.UI.Control();
+        item.border:SetParent(item);
+        item.border:SetSize(size, size);
+        item.border:SetPosition(0, 0);
+        item.border:SetBackColor(COLORS.DEBUFF_BG);
+        item.border:SetMouseVisible(false);
+        item.border:SetZOrder(-1);
+    end
+    
     -- Timer label
+    local timerColor = isDebuff and COLORS.TEXT_RED or COLORS.TEXT_WHITE;
     item.timerLabel = CreateLabel(
         item, -5, size - 4, size + 10, 16,
         Turbine.UI.Lotro.Font.Verdana12,
-        COLORS.TEXT_WHITE,
+        timerColor,
         Turbine.UI.ContentAlignment.TopCenter
     );
     item.timerLabel:SetOutlineColor(COLORS.BLACK);
@@ -1174,7 +1349,7 @@ function HealthBarWindow:CreateBuffIconItem()
         if sender.effectName and sender.effectName ~= "" then
             sender.tooltipName:SetText(sender.effectName);
             
-            -- Build tooltip body with description + duration
+            -- Build tooltip body
             local body = sender.effectDesc or "";
             
             if sender.effectDuration and sender.effectDuration > 0 then
@@ -1193,7 +1368,7 @@ function HealthBarWindow:CreateBuffIconItem()
             
             sender.tooltipDesc:SetText(body);
             
-            -- Auto-size tooltip based on content
+            -- Auto-size tooltip
             local lines = 2;
             for _ in string.gmatch(body, "\n") do lines = lines + 1; end
             local descLines = math.max(lines, math.ceil(string.len(body) / 38));
@@ -1203,11 +1378,24 @@ function HealthBarWindow:CreateBuffIconItem()
             sender.tooltip:SetSize(TT_WIDTH, ttHeight);
             sender.tooltipDesc:SetSize(TT_WIDTH - 8, ttHeight - 32);
             
-            -- Position tooltip above icon
+            -- Position tooltip: above for buffs (bottom panel), below for debuffs (top panel)
             local ix, iy = sender:GetPosition();
-            local px, py = win.buffPanel:GetPosition();
+            local px, py = parentPanel:GetPosition();
             local wx, wy = win:GetPosition();
-            sender.tooltip:SetPosition(wx + px + ix - (TT_WIDTH/2) + (size/2), wy + py + iy - ttHeight - 4);
+            
+            if isDebuff then
+                -- Tooltip below icon (debuffs are at top)
+                sender.tooltip:SetPosition(
+                    wx + px + ix - (TT_WIDTH/2) + (size/2), 
+                    wy + py + iy + size + 20
+                );
+            else
+                -- Tooltip above icon (buffs are at bottom)
+                sender.tooltip:SetPosition(
+                    wx + px + ix - (TT_WIDTH/2) + (size/2), 
+                    wy + py + iy - ttHeight - 4
+                );
+            end
             sender.tooltip:SetVisible(true);
         end
     end;
@@ -1235,11 +1423,22 @@ function HealthBarWindow:CreateBuffIconItem()
     return item;
 end
 
+-- =========================================================================
+-- BUFF/DEBUFF TIMER UPDATES
+-- =========================================================================
 function HealthBarWindow:UpdateBuffTimers()
-    if not self.activeBuffs then return; end
+    self:UpdateIconTimers(self.activeBuffs);
+end
+
+function HealthBarWindow:UpdateDebuffTimers()
+    self:UpdateIconTimers(self.activeDebuffs);
+end
+
+function HealthBarWindow:UpdateIconTimers(iconList)
+    if not iconList then return; end
     local currentTime = Turbine.Engine.GetGameTime();
     
-    for _, row in ipairs(self.activeBuffs) do
+    for _, row in ipairs(iconList) do
         if row.effect then
             local duration = row.effect:GetDuration();
             local startTime = row.effect:GetStartTime();
@@ -1262,6 +1461,9 @@ function HealthBarWindow:UpdateBuffTimers()
     end
 end
 
+-- =========================================================================
+-- EFFECT CLASSIFICATION
+-- =========================================================================
 function HealthBarWindow:IsEffectHarmful(effect)
     if not effect then return false; end
     
